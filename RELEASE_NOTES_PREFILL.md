@@ -13,6 +13,8 @@ prefill implementation for Qwen3.8-27B on RTX 3090/SM86.
   scheduling, cuBLAS-backed large shapes and SM86 attention/dequantization.
 - Generated malformed UTF-8 is logged and repaired per request so it does not
   take the serving worker down. This is a stability fix, not a speed claim.
+- The Windows package includes C6 64K and C6 96K RK8V4 launchers on port 8080.
+- The model downloader pins and verifies the compatible Qwen3.8 container-v2 artifact instead of following the mutable Hugging Face `main` branch.
 
 Results are specific to the tested RTX 3090, Qwen3.8-27B groupwise-int model,
 32K input, INT8 KV, 64K shared capacity, chunk 2048, MTP3 and CUDA Graph setup.

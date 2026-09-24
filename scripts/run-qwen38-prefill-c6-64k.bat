@@ -5,7 +5,7 @@ title NInfer RTX 3090 - Qwen3.8-27B faster prefill - C6 64K
 set "ROOT=%~dp0"
 set "SERVER=%ROOT%ninfer-serve.exe"
 set "MODEL=%ROOT%models\qwen3_8_27b.ninfer"
-set "PORT=8005"
+set "PORT=8080"
 set "LOG_DIR=%ROOT%logs"
 
 if not "%~1"=="" set "MODEL=%~1"

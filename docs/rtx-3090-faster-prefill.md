@@ -61,7 +61,10 @@ driver for runtime validation.
 
 ## Runtime profile
 
-The release includes `run-qwen38-prefill-c6-64k.bat`, which starts the OpenAI-
-compatible server on port 8005 with shared 64K context/KV capacity, concurrency
-6, RK8V4, chunk 2048, MTP3, LM-head draft and CUDA Graphs. Download the official
-Qwen3.8 `.ninfer` artifact separately; GGUF files are not compatible.
+The release includes `run-qwen38-prefill-c6-64k.bat` and
+`run-qwen38-c6-96k-rk8v4.bat`. Both start the OpenAI-compatible server on port
+8080 with concurrency 6, RK8V4, chunk 2048, MTP3, LM-head draft and CUDA
+Graphs. The launchers provide shared KV capacities of 64K and 96K respectively.
+Use `download-qwen38.bat` to obtain and verify the pinned compatible container-v2
+Qwen3.8 artifact; GGUF and the current container-v3 Hugging Face artifact are
+not compatible with this release.

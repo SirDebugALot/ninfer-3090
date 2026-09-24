@@ -15,6 +15,20 @@ OpenAI/Anthropic serving APIs.
 The bundled applications and dependency DLLs are native Windows executables. Model artifacts are
 not included in the release archive.
 
+## Quick start for Qwen3.8-27B
+
+1. Double-click `download-qwen38.bat`. It downloads the pinned 16.96 GiB container-v2 artifact used by this release, resumes interrupted transfers, and verifies SHA-256.
+2. Double-click one launcher:
+
+| Launcher | Profile |
+|---|---|
+| `run-qwen38-prefill-c6-64k.bat` | Six concurrent requests sharing a 64K RK8V4 cache |
+| `run-qwen38-c6-96k-rk8v4.bat` | Six concurrent requests sharing a 96K RK8V4 cache |
+
+Both launchers serve `http://127.0.0.1:8080/v1` with MTP3, LM-head draft, CUDA Graphs, prefix reuse, request logging, and a 2,048-token prefill chunk. The KV capacity is shared across active requests. RK8V4 is experimental and lossy: keys use 8-bit storage and values use 4-bit storage.
+
+The downloader pins Hugging Face revision `18dfc887423fa5aabf3cb56fac41490e462b3fab` and verifies SHA-256 `eec39564993d6e9c7d5e383382a760f093465c9d163ec9a1bd6b80199514bf3e`. The current unpinned Hugging Face `main` artifact is container v3 with DFlash2 payloads and is not compatible with this container-v1/v2 reader.
+
 ## Download the compatible Qwen3.6-35B artifact
 
 The published RTX 3090 measurements use the compact 20.84 GiB container-v1 artifact. Pin its

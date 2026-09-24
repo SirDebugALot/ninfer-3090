@@ -71,19 +71,17 @@ results yet.
 ### Windows 11
 
 1. Download and unzip the latest [Windows release](https://github.com/SirDebugALot/ninfer-3090/releases/latest).
-2. Double-click `download-qwen38.bat` to download the model. Interrupted downloads resume.
+2. Double-click `download-qwen38.bat`. It downloads the pinned 16.96 GiB container-v2 Qwen3.8 artifact used by this build, resumes interrupted transfers, and verifies SHA-256.
 3. Double-click one launcher:
 
 | Launcher | Best for |
 |---|---|
-| `run-qwen38-c1.bat` | One interactive user, lowest latency, up to 64K context |
-| `run-qwen38-c8.bat` | Multiple users or agents, highest aggregate throughput, 8K context |
+| `run-qwen38-prefill-c6-64k.bat` | Six concurrent requests sharing a 64K RK8V4 cache (8-bit keys, 4-bit values) |
 | `run-qwen38-c6-96k-rk8v4.bat` | Six concurrent requests sharing a 96K RK8V4 cache (8-bit keys, 4-bit values) |
-| `run-qwen38-vision.bat` | Qwen3.8 image understanding, one user, 32K context, MTP3 |
-| `run-qwen36-35b-vision.bat` | Image understanding with Qwen3.6-35B-A3B, one user, 32K context |
 
-The API is then available at `http://127.0.0.1:8080/v1`. The Windows archive includes the required
-applications and DLLs.
+Both launchers enable MTP3, LM-head draft, CUDA Graphs, prefix reuse, request logging, and a 2,048-token prefill chunk. The API is available at `http://127.0.0.1:8080/v1`.
+
+The 64K or 96K figure is the shared physical KV capacity, not that amount for each of the six requests. One request may use the full configured context while multiple active requests divide the same pool. RK8V4 is experimental and lossy; it stores keys at 8 bits and values at 4 bits. The Windows archive includes the two launchers, the model downloader, applications, and required DLLs.
 
 ## Qwen3.8-27B support and RTX 3090 results
 
@@ -163,7 +161,7 @@ validation; do not use it as the default for correctness-sensitive work.
 ### Qwen3.8 vision
 
 The same Qwen3.8 artifact supports images. Start the server with `--vision`, MTP3, INT8 KV, and a
-32K maximum context. The Windows archive includes `run-qwen38-vision.bat` for this profile.
+32K maximum context. A source-tree example is available as `scripts/run-qwen38-vision.bat`; the streamlined RTX 3090 prefill Windows archive packages only the two C6 text launchers listed above.
 
 A 1,920×1,080 image expanded to 2,074 prompt tokens and was read correctly. Measured TTFT was
 3.29 seconds, decode reached 98.1 tok/s, MTP acceptance was 96.7%, and startup retained 2.16 GiB
@@ -194,7 +192,8 @@ reducing measured prefill from 371 ms to 10 ms.
 
 The compact 35B artifact includes its vision encoder and accepts images through the same OpenAI-
 compatible API. Start the server with `--vision` and leave speculative decoding disabled. The
-Windows archive includes `run-qwen36-35b-vision.bat` for this profile.
+source tree includes `scripts/run-qwen36-35b-vision.bat`; the streamlined RTX 3090 prefill Windows
+archive does not package the 35B model downloader or Vision launcher.
 
 The safe RTX 3090 profile is **one request, 32K maximum context, INT8 KV, vision enabled, and MTP
 disabled**. A current v0.6 test processed three 1,920×1,080 images correctly. Each image expanded
@@ -224,7 +223,7 @@ still use MTP3 as documented above.
 | Qwen3.6-35B-A3B v1 | [pinned compact artifact](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/tree/c8b8c1c0df4c74df3c190c6aa3a7f24dc614721c) | 20.84 GiB | **Recommended for RTX 3090; text C1-C6 at 4K and vision C1 at 32K** |
 | Qwen3.6-35B-A3B v2 | [current upstream artifact](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | 21.22 GiB | Reader supported by v0.5+; includes DFlash payload and is not the measured 3090 artifact |
 | Qwen3.6-27B | [groupwise artifact](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) | 16.29 GiB | Supported with more runtime headroom |
-| **Qwen3.8-27B** | [official NInfer groupwise artifact](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | 16.96 GiB | **Validated at C1, C2, C4 and C8/MTP3 with ReplaySSM** |
+| **Qwen3.8-27B** | [pinned container-v2 artifact](https://huggingface.co/neroued/Qwen3.8-27B-NInfer/tree/18dfc887423fa5aabf3cb56fac41490e462b3fab) | 16.96 GiB | **Validated at C1, C2, C4 and C8/MTP3 with ReplaySSM** |
 
 NInfer-3090 v0.5 and newer recognize both v1 and v2 container magic. The current 21.22 GiB v2
 artifact contains additional DFlash weights and is not the artifact used for the published RTX
@@ -237,8 +236,7 @@ Linux users build the applications from source or use the Docker image. Windows 
 prebuilt archive, which includes the applications and required DLLs. Both platforms require an
 RTX 3090 or RTX 3090 Ti and a recent NVIDIA driver.
 
-Download the [official Qwen3.8 artifact](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) as
-`models/qwen3_8_27b.ninfer`. Windows users can run `download-qwen38.bat` instead.
+Download the [pinned Qwen3.8 container-v2 artifact](https://huggingface.co/neroued/Qwen3.8-27B-NInfer/tree/18dfc887423fa5aabf3cb56fac41490e462b3fab) as `models/qwen3_8_27b.ninfer`. Its SHA-256 is `eec39564993d6e9c7d5e383382a760f093465c9d163ec9a1bd6b80199514bf3e`. Windows users can run `download-qwen38.bat`, which downloads and verifies that exact artifact. Do not download the repository's current `main` artifact: it is container v3 with DFlash2 payloads, while this RTX 3090 release reads container v1/v2.
 
 For Qwen3.6-35B-A3B, the smaller
 [pinned container-v1 artifact](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/tree/c8b8c1c0df4c74df3c190c6aa3a7f24dc614721c)
