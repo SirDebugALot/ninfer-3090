@@ -120,12 +120,12 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
 }
 
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, WorkspaceArena& ws,
-                cudaStream_t stream) {
-    linear_add(x, w, residual_out, LinearPolicy::A16Only, ws, stream);
+                cudaStream_t stream, cublasHandle_t blas) {
+    linear_add(x, w, residual_out, LinearPolicy::A16Only, ws, stream, blas);
 }
 
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPolicy policy,
-                WorkspaceArena& ws, cudaStream_t stream) {
+                WorkspaceArena& ws, cudaStream_t stream, cublasHandle_t blas) {
     validate_policy(policy);
     const std::int32_t t = x.ne[1];
     if (t <= 0) { throw std::invalid_argument("linear_add: T must be positive"); }
@@ -165,7 +165,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
             throw std::invalid_argument(
                 "linear_add: Q5 requires 16-byte x/residual/code/high/scale alignment");
         }
-        detail::q5_linear_add_dispatch(x, w, residual_out, ws, stream);
+        detail::q5_linear_add_dispatch(x, w, residual_out, ws, stream, blas);
         return;
     }
 

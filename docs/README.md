@@ -8,6 +8,7 @@ run the CLI or HTTP server.
 | Document | Purpose |
 |---|---|
 | [RTX 3090 Linux build](rtx-3090-linux.md) | Docker and native Ubuntu builds for the `sm_86` applications |
+| [RTX 3090 faster prefill](rtx-3090-faster-prefill.md) | Short SM86 optimization summary, benchmark scope, build and release notes |
 | [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, MTP, and common runtime options |
 | [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, and tool calls |
 | [Performance](performance.md) | RTX 5090 single-request and concurrent-decode results, MTP/DFlash measurements, and reproduction commands |

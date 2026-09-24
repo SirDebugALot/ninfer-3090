@@ -129,8 +129,9 @@ void Variant::attention_projection(const Tensor& hidden,
 
 void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,
                                           Tensor& residual, qwen3_6::TextPhase,
-                                          WorkspaceArena& workspace, cudaStream_t stream) {
-    ops::linear_add(attention, weight, residual, text_policy(weight), workspace, stream);
+                                          WorkspaceArena& workspace, cudaStream_t stream,
+                                          cublasHandle_t blas) {
+    ops::linear_add(attention, weight, residual, text_policy(weight), workspace, stream, blas);
 }
 
 void Variant::mtp_attention_projection(const Tensor& hidden,
@@ -162,13 +163,14 @@ void Variant::mtp_q_gate_projection(const Tensor& hidden,
 
 void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
                                    Tensor& qkv, Tensor& output_gate, qwen3_6::TextPhase,
-                                   WorkspaceArena& workspace, cudaStream_t stream) {
+                                   WorkspaceArena& workspace, cudaStream_t stream,
+                                   cublasHandle_t blas) {
     Tensor output_gate_flat =
         output_gate.view({TextConfig::value_dim, static_cast<int>(hidden.ne[1])});
     if (const auto* split =
             std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
         ops::gdn_input_proj(hidden, split->query_key, split->value_z, qkv, output_gate_flat,
-                            stream);
+                            workspace, stream, blas);
         return;
     }
     const Weight& fused =
@@ -225,8 +227,8 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
 
 void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
                                     qwen3_6::TextPhase, WorkspaceArena& workspace,
-                                    cudaStream_t stream) {
-    ops::linear_add(hidden, weight, residual, text_policy(weight), workspace, stream);
+                                    cudaStream_t stream, cublasHandle_t blas) {
+    ops::linear_add(hidden, weight, residual, text_policy(weight), workspace, stream, blas);
 }
 
 void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& norm_weight,
@@ -239,13 +241,14 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
 }
 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
-                         qwen3_6::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
+                         qwen3_6::TextPhase, WorkspaceArena& workspace, cudaStream_t stream,
+                         cublasHandle_t blas) {
     auto scope        = workspace.scope();
     Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, hidden.ne[1]});
     ops::linear_swiglu(hidden, weights.gate_up, activation, text_policy(weights.gate_up), workspace,
                        stream);
     ops::linear_add(activation, weights.down, residual, text_policy(weights.down), workspace,
-                    stream);
+                    stream, blas);
 }
 
 void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
@@ -324,7 +327,8 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
     switch (weights_profile) {
     case WeightsProfile::GroupwiseInt:
     case WeightsProfile::GroupwiseIntW8Endpoints:
-        return 0;
+        return ops::gdn_input_proj_workspace_capacity_bytes(
+            TextConfig::hidden, 4096, 12288, first, last);
     case WeightsProfile::Nvfp4:
         return ops::gdn_input_proj_workspace_capacity_bytes(QType::NVFP4, 16384, TextConfig::hidden,
                                                             kNvfp4TextPolicy, first, last);

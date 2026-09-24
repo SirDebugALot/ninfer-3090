@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 
 #include <cstddef>
 
@@ -14,6 +15,9 @@ struct DeviceContext {
     int device               = 0;
     cudaStream_t stream      = nullptr;
     cudaStream_t load_stream = nullptr;
+    // One handle per execution context, bound to stream before any graph capture. Ops supply
+    // caller-owned workspace for each use; no handle is shared between Engine instances.
+    cublasHandle_t blas      = nullptr;
     cudaDeviceProp props{};
 
     explicit DeviceContext(int device_id = 0);

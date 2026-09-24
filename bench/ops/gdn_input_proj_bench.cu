@@ -246,7 +246,7 @@ void measure_points(const Options& options, const char* format, const char* poli
 }
 
 void run_q4q5(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
-              std::vector<Result>& results) {
+              std::vector<Result>& results, cublasHandle_t blas) {
     constexpr std::int32_t kHidden     = 5120;
     constexpr std::int32_t kQkRows     = 4096;
     constexpr std::int32_t kValueRows  = 6144;
@@ -260,18 +260,27 @@ void run_q4q5(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
     DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_tokens);
     DeviceBuffer qkv(static_cast<std::size_t>(kQkRows + kValueRows) * max_tokens * 2);
     DeviceBuffer z(static_cast<std::size_t>(kZRows) * max_tokens * 2);
+    const std::size_t maximum_workspace = ops::gdn_input_proj_workspace_capacity_bytes(
+        kHidden, kQkRows, kValueRows + kZRows, 1, max_tokens);
+    WorkspaceArena workspace(std::max<std::size_t>(maximum_workspace, 256));
     const auto make_launch = [&](std::int32_t tokens) {
         return [&, tokens](cudaStream_t launch_stream) {
             Tensor x(input.p, DType::BF16, {kHidden, tokens});
             Tensor tqkv(qkv.p, DType::BF16, {kQkRows + kValueRows, tokens});
             Tensor tz(z.p, DType::BF16, {kZRows, tokens});
-            ops::gdn_input_proj(x, qk.weight, value_z.weight, tqkv, tz, launch_stream);
+            ops::gdn_input_proj(x, qk.weight, value_z.weight, tqkv, tz, workspace,
+                                launch_stream, blas);
         };
     };
+    const auto workspace_capacity = [](std::int32_t tokens) {
+        return ops::gdn_input_proj_workspace_capacity_bytes(
+            kHidden, kQkRows, kValueRows + kZRows, tokens, tokens);
+    };
+    CUDA_CHECK(cudaDeviceSynchronize());
     measure_points(
         options, "q4q5", "a16", kHidden, kOutputRows,
         qk.model_weight_bytes() + value_z.model_weight_bytes(),
-        [](std::int32_t) { return std::size_t{0}; }, make_launch, flush, stream, results);
+        workspace_capacity, make_launch, flush, stream, results);
 }
 
 void run_w8(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
@@ -365,17 +374,18 @@ int main(int argc, char** argv) {
             return 0;
         }
         const Options options = parse_options(argc, argv);
-        cudaStream_t stream   = nullptr;
-        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        DeviceContext context(0);
+        cudaStream_t stream = context.stream;
         DeviceBuffer flush(kFlushBytes);
         std::vector<Result> results;
 
-        if (selected(options.format, Format::Q4Q5)) { run_q4q5(options, flush, stream, results); }
+        if (selected(options.format, Format::Q4Q5)) {
+            run_q4q5(options, flush, stream, results, context.blas);
+        }
         if (selected(options.format, Format::W8)) { run_w8(options, flush, stream, results); }
         if (selected(options.format, Format::Nvfp4)) { run_nvfp4(options, flush, stream, results); }
 
         write_csv(options, results);
-        CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "ninfer_gdn_input_proj_bench: %s\n", error.what());

@@ -55,6 +55,14 @@ void launch_route(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
 
 void q4_linear_swiglu_mma_split_half_pair_r32_c128_launch(const Tensor& x, const Weight& weight,
                                                           Tensor& out, cudaStream_t stream) {
+#if defined(NINFER_Q4_CUDA126_FULL)
+    // CUDA 12.6 improves the qualified full-tile prefill kernel, but its tail
+    // kernel regresses. Decode, MTP, small T, and every tail retain the main build.
+    if (x.ne[1] >= 1024 && (x.ne[1] % 128) == 0) {
+        q4_linear_swiglu_cuda126_full_launch(x, weight, out, stream);
+        return;
+    }
+#endif
     launch_route<GateUpC128Cfg>(x, weight, out, stream);
 }
 

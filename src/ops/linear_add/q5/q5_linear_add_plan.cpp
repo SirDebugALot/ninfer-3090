@@ -94,6 +94,8 @@ const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept
         return "linear_add.q5.mma.r64.c64.cta_collective_residual";
     case Q5LinearAddScheduleId::MmaResidualR64C128:
         return "linear_add.q5.mma.r64.c128.cta_collective_residual";
+    case Q5LinearAddScheduleId::DequantCublasResidual:
+        return "linear_add.q5.dequant.cublas.residual";
     }
     return "linear_add.q5.unknown";
 }
@@ -102,11 +104,15 @@ bool q5_linear_add_admits(const Q5LinearAddProblem& problem) noexcept {
     return supported_shape(problem) && problem.cols >= 1;
 }
 
-Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem) {
+Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem, bool has_blas) {
     if (!q5_linear_add_admits(problem)) {
         throw std::invalid_argument("q5 linear_add: exact problem or column count is not admitted");
     }
 
+    if (has_blas && problem.cols >= 1024 && problem.cols % 128 == 0) {
+        return {Q5LinearAddScheduleId::DequantCublasResidual,
+                std::size_t(problem.rows) * problem.k * 2 + kQ5BlasWorkspaceBytes};
+    }
     const auto resolve_from = [&](const auto& routes) -> Q5LinearAddPlan {
         for (const RouteSpec& route : routes) {
             if (route.cols.contains(problem.cols)) { return {route.schedule, 0}; }
@@ -125,19 +131,25 @@ std::size_t q5_linear_add_capacity_workspace_bytes(std::int32_t rows, std::int32
     (void)q5_linear_add_resolve_plan({rows, k, padded_k, min_cols});
     (void)q5_linear_add_resolve_plan({rows, k, padded_k, max_cols});
 
-    return 0;
+    const auto first_blas_cols = ((std::int64_t(min_cols) + 127) / 128) * 128;
+    return max_cols >= 1024 && first_blas_cols <= max_cols
+               ? std::size_t(rows) * k * 2 + kQ5BlasWorkspaceBytes : 0;
 }
 
 void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, const Weight& w,
-                                Tensor& residual_out, WorkspaceArena& ws, cudaStream_t stream) {
+                                Tensor& residual_out, WorkspaceArena& ws, cudaStream_t stream,
+                                cublasHandle_t blas) {
     const Q5LinearAddProblem problem{residual_out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
-    const Q5LinearAddPlan resolved = q5_linear_add_resolve_plan(problem);
+    const Q5LinearAddPlan resolved = q5_linear_add_resolve_plan(problem, blas != nullptr);
     if (resolved.schedule != plan.schedule || resolved.workspace_bytes != plan.workspace_bytes) {
         throw std::invalid_argument("q5 linear_add: plan does not match the exact problem");
     }
     (void)ws;
 
     switch (plan.schedule) {
+    case Q5LinearAddScheduleId::DequantCublasResidual:
+        q5_linear_add_cublas_launch(x, w, residual_out, ws, stream, blas);
+        return;
     case Q5LinearAddScheduleId::GemvResidual:
         q5_linear_add_gemv_residual_launch(x, w, residual_out, stream);
         return;
@@ -161,10 +173,10 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
 }
 
 void q5_linear_add_dispatch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                            WorkspaceArena& ws, cudaStream_t stream) {
+                            WorkspaceArena& ws, cudaStream_t stream, cublasHandle_t blas) {
     const Q5LinearAddProblem problem{residual_out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
-    const Q5LinearAddPlan plan = q5_linear_add_resolve_plan(problem);
-    q5_linear_add_execute_plan(plan, x, w, residual_out, ws, stream);
+    const Q5LinearAddPlan plan = q5_linear_add_resolve_plan(problem, blas != nullptr);
+    q5_linear_add_execute_plan(plan, x, w, residual_out, ws, stream, blas);
 }
 
 } // namespace ninfer::ops::detail

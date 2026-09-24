@@ -1,6 +1,7 @@
 #include "ops/linear_swiglu/linear_swiglu_test_common.h"
 
 #include "core/arena.h"
+#include "core/decode_graph.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
@@ -63,19 +64,28 @@ std::vector<std::uint16_t> make_activation(const Profile& profile, std::int32_t 
         checked_elements(profile.input_rows, tokens, "activation size"), 0);
 
     // Token zero is dense, so every logical K contributes to every production implementation.
-    // Later tokens use exact zeros plus a rotating set of nonzeros. This keeps a full-output,
+    // Q4 also makes token 64 dense to exercise both halves of a 128-token prefill tile.
+    // Other tokens use exact zeros plus a rotating set of nonzeros. This keeps a full-output,
     // full-formula oracle practical at large registered T boundaries without adopting any
     // production staging or reduction behavior.
     const float dense_scale = profile.qtype == QType::Q4G64_F16S
                                   ? 1.25e-4F
                                   : (profile.qtype == QType::NVFP4 ? 1.0e-3F : 1.0e-5F);
-    for (std::int32_t column = 0; column < profile.input_rows; ++column) {
-        const std::uint64_t mixed = mix64((static_cast<std::uint64_t>(profile.seed) << 32) |
-                                          static_cast<std::uint32_t>(column));
-        int numerator             = static_cast<int>((mixed >> 48) % 63U) - 31;
-        if (numerator == 0) { numerator = (column & 1) == 0 ? 1 : -1; }
-        const float value                            = static_cast<float>(numerator) * dense_scale;
-        activation[static_cast<std::size_t>(column)] = test::f32_to_bf16(value);
+    constexpr std::int32_t kDenseTokens[]{0, 64};
+    for (const std::int32_t token : kDenseTokens) {
+        if (token >= tokens || (token != 0 && profile.qtype != QType::Q4G64_F16S)) { continue; }
+        for (std::int32_t column = 0; column < profile.input_rows; ++column) {
+            const std::uint64_t coordinate =
+                (static_cast<std::uint64_t>(profile.seed) << 32) |
+                static_cast<std::uint32_t>(column);
+            const std::uint64_t mixed =
+                mix64(coordinate ^ (static_cast<std::uint64_t>(token) * 0x9e3779b97f4a7c15ULL));
+            int numerator = static_cast<int>((mixed >> 48) % 63U) - 31;
+            if (numerator == 0) { numerator = (column & 1) == 0 ? 1 : -1; }
+            const float value = static_cast<float>(numerator) * dense_scale;
+            activation[static_cast<std::size_t>(token) * profile.input_rows + column] =
+                test::f32_to_bf16(value);
+        }
     }
 
     constexpr std::int32_t kNonzerosPerSparseToken = 4;
@@ -83,6 +93,7 @@ std::vector<std::uint16_t> make_activation(const Profile& profile, std::int32_t 
                                                          ? 1.5e-2F
                                                          : (profile.qtype == QType::NVFP4 ? 2.0e-2F : 1.5e-3F);
     for (std::int32_t token = 1; token < tokens; ++token) {
+        if (profile.qtype == QType::Q4G64_F16S && token == 64) { continue; }
         for (std::int32_t lane = 0; lane < kNonzerosPerSparseToken; ++lane) {
             const std::uint64_t mixed =
                 mix64((static_cast<std::uint64_t>(profile.seed + 1U) << 32) |
@@ -303,6 +314,46 @@ int run_profile(std::string_view label, const Profile& profile,
         const std::vector<double> actual = read_bf16_output(output, output_elements);
         failures +=
             compare_output(case_label, actual, reference.data(), profile.activation_compute);
+
+        if (profile.qtype == QType::Q4G64_F16S && tokens == 2048) {
+            cudaStream_t graph_stream = nullptr;
+            test::cuda_check(cudaStreamCreateWithFlags(&graph_stream, cudaStreamNonBlocking),
+                             "create LinearSwiGLU graph stream");
+            try {
+                DecodeGraphDefinition definition;
+                DecodeGraphExecutable executable;
+                output.fill(0xff);
+                test::cuda_check(cudaDeviceSynchronize(), "finish LinearSwiGLU capture poison");
+                workspace.reset();
+                workspace.reset_peak();
+                definition.capture(graph_stream, [&] {
+                    ops::linear_swiglu(x, weight, destination, policy, workspace, graph_stream);
+                });
+                executable.instantiate(definition);
+                if (workspace.used() != 0 || workspace.peak_used() != exact_workspace) {
+                    std::cerr << case_label << ": graph capture workspace high-water mismatch\n";
+                    ++failures;
+                }
+                for (int replay = 0; replay < 2; ++replay) {
+                    // A replay must overwrite the complete output, not reuse an eager result.
+                    output.fill(0xff);
+                    test::cuda_check(cudaDeviceSynchronize(), "finish LinearSwiGLU replay poison");
+                    executable.launch(graph_stream);
+                    test::cuda_check(cudaStreamSynchronize(graph_stream),
+                                     "synchronize LinearSwiGLU graph replay");
+                    const std::string graph_label =
+                        case_label + " graph replay=" + std::to_string(replay);
+                    failures += output.verify_guards(graph_label);
+                    const std::vector<double> graph_actual = read_bf16_output(output, output_elements);
+                    failures += compare_output(graph_label, graph_actual, reference.data(),
+                                               profile.activation_compute);
+                }
+            } catch (...) {
+                (void)cudaStreamDestroy(graph_stream);
+                throw;
+            }
+            test::cuda_check(cudaStreamDestroy(graph_stream), "destroy LinearSwiGLU graph stream");
+        }
     }
     failures += device_activation.verify_guards(std::string(label) + " activation");
     failures += device_weight.verify_guards(std::string(label) + " weight");

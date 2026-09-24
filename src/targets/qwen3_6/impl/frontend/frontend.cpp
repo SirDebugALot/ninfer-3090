@@ -371,47 +371,66 @@ void append_delta(PublishedOutput& output, OutputChannel channel, std::string te
     }
 }
 
-std::size_t valid_utf8_prefix_size(std::string_view bytes) {
-    std::size_t offset = 0;
-    while (offset < bytes.size()) {
-        const auto lead         = static_cast<unsigned char>(bytes[offset]);
-        std::size_t length      = 0;
-        std::uint32_t codepoint = 0;
-        std::uint32_t minimum   = 0;
-        if (lead <= 0x7fU) {
-            length    = 1;
-            codepoint = lead;
-        } else if (lead >= 0xc2U && lead <= 0xdfU) {
-            length    = 2;
-            codepoint = lead & 0x1fU;
-            minimum   = 0x80U;
-        } else if (lead >= 0xe0U && lead <= 0xefU) {
-            length    = 3;
-            codepoint = lead & 0x0fU;
-            minimum   = 0x800U;
-        } else if (lead >= 0xf0U && lead <= 0xf4U) {
-            length    = 4;
-            codepoint = lead & 0x07U;
-            minimum   = 0x10000U;
-        } else {
-            throw std::invalid_argument("invalid UTF-8 leading byte in generated token stream");
-        }
-        if (offset + length > bytes.size()) { return offset; }
-        for (std::size_t index = 1; index < length; ++index) {
-            const auto byte = static_cast<unsigned char>(bytes[offset + index]);
-            if ((byte & 0xc0U) != 0x80U) {
-                throw std::invalid_argument(
-                    "invalid UTF-8 continuation byte in generated token stream");
-            }
-            codepoint = (codepoint << 6U) | (byte & 0x3fU);
-        }
-        if (codepoint < minimum || (codepoint >= 0xd800U && codepoint <= 0xdfffU) ||
-            codepoint > 0x10ffffU) {
-            throw std::invalid_argument("invalid UTF-8 codepoint in generated token stream");
-        }
-        offset += length;
+std::string diagnostic_hex(std::string_view bytes, std::size_t maximum = 96) {
+    constexpr char digits[] = "0123456789ABCDEF";
+    std::string out;
+    const std::size_t count = std::min(bytes.size(), maximum);
+    out.reserve(count * 2 + 32);
+    for (std::size_t index = 0; index < count; ++index) {
+        const auto byte = static_cast<unsigned char>(bytes[index]);
+        out.push_back(digits[byte >> 4U]);
+        out.push_back(digits[byte & 15U]);
     }
-    return offset;
+    if (count != bytes.size()) { out += "...(bytes=" + std::to_string(bytes.size()) + ")"; }
+    return out.empty() ? "<empty>" : out;
+}
+
+struct GeneratedUtf8Unit {
+    std::size_t size = 0;
+    bool incomplete = false;
+    std::string_view repair_reason;
+};
+
+GeneratedUtf8Unit generated_utf8_unit(std::string_view bytes, std::size_t offset) {
+    const auto lead = static_cast<unsigned char>(bytes[offset]);
+    std::size_t length = 0;
+    if (lead <= 0x7fU) {
+        return {.size = 1};
+    } else if (lead >= 0xc2U && lead <= 0xdfU) {
+        length = 2;
+    } else if (lead >= 0xe0U && lead <= 0xefU) {
+        length = 3;
+    } else if (lead >= 0xf0U && lead <= 0xf4U) {
+        length = 4;
+    } else {
+        return {.size = 1, .repair_reason = "invalid_leading_byte"};
+    }
+
+    // Unicode maximal-subpart replacement consumes the longest prefix that could
+    // begin a well-formed scalar, leaving the first incompatible byte for rescan.
+    // Check available bytes before buffering: E0 80 is already ill-formed even
+    // when its nominal third byte has not arrived yet.
+    for (std::size_t index = 1; index < length; ++index) {
+        if (offset + index == bytes.size()) {
+            return {.size = index, .incomplete = true};
+        }
+        const auto byte = static_cast<unsigned char>(bytes[offset + index]);
+        if (byte < 0x80U || byte > 0xbfU) {
+            return {.size = index, .repair_reason = "invalid_continuation_byte"};
+        }
+        if (index == 1) {
+            if ((lead == 0xe0U && byte < 0xa0U) || (lead == 0xf0U && byte < 0x90U)) {
+                return {.size = 1, .repair_reason = "overlong_codepoint"};
+            }
+            if (lead == 0xedU && byte > 0x9fU) {
+                return {.size = 1, .repair_reason = "surrogate_codepoint"};
+            }
+            if (lead == 0xf4U && byte > 0x8fU) {
+                return {.size = 1, .repair_reason = "out_of_range_codepoint"};
+            }
+        }
+    }
+    return {.size = length};
 }
 
 std::size_t longest_suffix_prefix(std::string_view text, std::string_view marker,
@@ -424,16 +443,50 @@ std::size_t longest_suffix_prefix(std::string_view text, std::string_view marker
     return 0;
 }
 
+struct GeneratedTokenPosition {
+    TokenId id = 0;
+    std::uint64_t index = 0;
+    std::uint32_t in_round = 0;
+};
+
 struct DecoderState {
     std::string utf8_pending;
+    std::array<GeneratedTokenPosition, 3> utf8_pending_tokens{};
     std::string think_marker_pending;
     std::array<std::string, 2> stop_pending;
+    OutputDiagnostics diagnostics;
     bool in_reasoning              = false;
     bool strip_content_leading     = false;
     bool terminal                  = false;
     std::uint64_t decoded_bytes    = 0;
+    std::uint64_t generated_tokens = 0;
     std::uint32_t reasoning_tokens = 0;
 };
+
+void record_utf8_repair(DecoderState& state, std::string_view reason, std::string_view bytes,
+                        std::size_t offset, std::size_t size, GeneratedTokenPosition origin,
+                        const GeneratedTokenPosition* detected, std::size_t pending_before) {
+    ++state.diagnostics.utf8_replacements;
+    if (state.diagnostics.utf8_repair_examples.size() == 8) { return; }
+
+    const std::size_t window_begin = offset > 8 ? offset - 8 : 0;
+    std::string example = "reason=" + std::string(reason) +
+        " token_id=" + std::to_string(origin.id) +
+        " generated_token_index=" + std::to_string(origin.index) +
+        " token_in_round=" + std::to_string(origin.in_round) +
+        " byte_offset=" + std::to_string(offset) +
+        " replaced_bytes_hex=" + diagnostic_hex(bytes.substr(offset, size)) +
+        " byte_window_start=" + std::to_string(window_begin) +
+        " byte_window_hex=" + diagnostic_hex(bytes.substr(window_begin), 32) +
+        " pending_before_hex=" + diagnostic_hex(bytes.substr(0, pending_before));
+    if (detected != nullptr) {
+        example += " detected_token_id=" + std::to_string(detected->id) +
+            " detected_generated_token_index=" + std::to_string(detected->index) +
+            " detected_token_in_round=" + std::to_string(detected->in_round) +
+            " detected_token_bytes_hex=" + diagnostic_hex(bytes.substr(pending_before));
+    }
+    state.diagnostics.utf8_repair_examples.push_back(std::move(example));
+}
 
 struct StopMatch {
     bool found                      = false;
@@ -549,14 +602,38 @@ void feed_decoded_text(DecoderState& state, std::string_view text, const StopPol
     state.think_marker_pending.erase(0, safe);
 }
 
-void feed_token_bytes(DecoderState& state, std::string bytes, const StopPolicy& policy,
-                      PublishedOutput& emitted, std::uint32_t committed_tokens,
-                      StopMatch* best_match) {
+void feed_token_bytes(DecoderState& state, std::string_view bytes, GeneratedTokenPosition token,
+                      const StopPolicy& policy, PublishedOutput& emitted,
+                      std::uint32_t committed_tokens, StopMatch* best_match) {
+    const std::size_t pending_before = state.utf8_pending.size();
     state.utf8_pending += bytes;
-    const std::size_t valid = valid_utf8_prefix_size(state.utf8_pending);
-    if (valid == 0) { return; }
-    const std::string text = state.utf8_pending.substr(0, valid);
-    state.utf8_pending.erase(0, valid);
+    std::string text;
+    std::size_t offset = 0;
+    std::size_t valid_begin = 0;
+    while (offset < state.utf8_pending.size()) {
+        const GeneratedUtf8Unit unit = generated_utf8_unit(state.utf8_pending, offset);
+        if (unit.incomplete) { break; }
+        if (!unit.repair_reason.empty()) {
+            const GeneratedTokenPosition origin = offset < pending_before
+                ? state.utf8_pending_tokens[offset] : token;
+            record_utf8_repair(state, unit.repair_reason, state.utf8_pending, offset, unit.size,
+                               origin, &token, pending_before);
+            text.append(state.utf8_pending, valid_begin, offset - valid_begin);
+            text += "\xef\xbf\xbd";
+            valid_begin = offset + unit.size;
+        }
+        offset += unit.size;
+    }
+    text.append(state.utf8_pending, valid_begin, offset - valid_begin);
+
+    // Only a valid incomplete scalar remains, so at most three origins are needed.
+    // Preserve each byte's origin across rounds for later repair diagnostics.
+    for (std::size_t index = 0; index < state.utf8_pending.size() - offset; ++index) {
+        state.utf8_pending_tokens[index] = offset + index < pending_before
+            ? state.utf8_pending_tokens[offset + index] : token;
+    }
+    state.utf8_pending.erase(0, offset);
+    if (text.empty()) { return; }
     feed_decoded_text(state, text, policy, emitted, committed_tokens, best_match);
 }
 
@@ -566,6 +643,9 @@ void terminalize(DecoderState& state, const StopPolicy& policy, PublishedOutput&
         // A token budget can end between byte-level tokens of one code point.
         // Publish the standard replacement character rather than an invalid
         // UTF-8 suffix; the logical token prefix remains exact.
+        record_utf8_repair(state, "truncated_sequence", state.utf8_pending, 0,
+                           state.utf8_pending.size(), state.utf8_pending_tokens[0], nullptr,
+                           state.utf8_pending.size());
         state.utf8_pending.clear();
         feed_decoded_text(state, "\xef\xbf\xbd", policy, emitted, committed_tokens, nullptr);
     }
@@ -715,6 +795,7 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
     impl_->preview_output.clear();
 
     const auto complete = [&](std::uint32_t count, FinishReason reason) {
+        impl_->preview_state.generated_tokens = impl_->state.generated_tokens + count;
         impl_->preview_ready = true;
         return runtime::OutputDecision{.accepted_tokens = count, .finish_reason = reason};
     };
@@ -742,8 +823,12 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
         StopMatch match;
         const std::string bytes =
             impl_->tokenizer->decode_token_bytes(token, !impl_->preserve_special);
-        feed_token_bytes(impl_->preview_state, bytes, impl_->policy, impl_->preview_output, count,
-                         &match);
+        const GeneratedTokenPosition position{
+            .id = token,
+            .index = impl_->state.generated_tokens + index,
+            .in_round = static_cast<std::uint32_t>(index)};
+        feed_token_bytes(impl_->preview_state, bytes, position, impl_->policy,
+                         impl_->preview_output, count, &match);
 
         if (match.found) {
             impl_->preview_state  = terminal_state(std::move(impl_->preview_state));
@@ -796,6 +881,11 @@ PublishedOutput OutputSession::commit_preview() noexcept {
 
 std::uint32_t OutputSession::reasoning_tokens() const noexcept {
     return impl_ != nullptr ? impl_->state.reasoning_tokens : 0;
+}
+
+const OutputDiagnostics& OutputSession::output_diagnostics() const noexcept {
+    static const OutputDiagnostics empty;
+    return impl_ != nullptr ? impl_->state.diagnostics : empty;
 }
 
 Frontend::Frontend(std::shared_ptr<const Impl> impl) noexcept : impl_(std::move(impl)) {}

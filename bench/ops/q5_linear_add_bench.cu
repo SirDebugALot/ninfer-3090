@@ -32,6 +32,7 @@ struct Options {
     int warmup   = 5;
     int repeat   = 30;
     bool profile = false;
+    bool native = false;
 };
 
 std::vector<std::int32_t> parse_tokens(std::string_view raw) {
@@ -71,9 +72,11 @@ Options parse_options(int argc, char** argv) {
             options.repeat = std::stoi(std::string(next("--repeat value")));
         } else if (argument == "--profile") {
             options.profile = true;
+        } else if (argument == "--native") {
+            options.native = true;
         } else if (argument == "--help" || argument == "-h") {
             std::printf("Usage: %s --k 6144|17408 [--t-sweep 1,2,...] [--warmup N] "
-                        "[--repeat N] [--profile]\n",
+                        "[--repeat N] [--profile] [--native]\n",
                         argv[0]);
             std::exit(0);
         } else {
@@ -97,6 +100,7 @@ Options parse_options(int argc, char** argv) {
 int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
+        DeviceContext context;
         const auto [min_it, max_it] =
             std::minmax_element(options.tokens.begin(), options.tokens.end());
         const std::int32_t min_t = *min_it;
@@ -116,7 +120,8 @@ int main(int argc, char** argv) {
         const auto launch = [&](std::int32_t tokens, cudaStream_t launch_stream) {
             Tensor x(input.p, DType::BF16, {options.hidden, tokens});
             Tensor out(residual.p, DType::BF16, {kRows, tokens});
-            ops::linear_add(x, packed.weight, out, workspace, launch_stream);
+            ops::linear_add(x, packed.weight, out, workspace, launch_stream,
+                             options.native ? nullptr : context.blas);
         };
 
         if (options.profile) {
@@ -124,7 +129,7 @@ int main(int argc, char** argv) {
             launch(tokens, stream);
             CUDA_CHECK(cudaStreamSynchronize(stream));
             const auto plan = ops::detail::q5_linear_add_resolve_plan(
-                {kRows, options.hidden, options.hidden, tokens});
+                  {kRows, options.hidden, options.hidden, tokens}, !options.native);
             std::printf("profile K=%d T=%d route=%s workspace=%zu\n", options.hidden, tokens,
                         ops::detail::q5_linear_add_schedule_name(plan.schedule),
                         workspace_capacity);
@@ -146,7 +151,7 @@ int main(int argc, char** argv) {
                             bytes / seconds / 1.0e9, flops / seconds / 1.0e12);
             };
             const auto plan = ops::detail::q5_linear_add_resolve_plan(
-                {kRows, options.hidden, options.hidden, tokens});
+                  {kRows, options.hidden, options.hidden, tokens}, !options.native);
             measure(ops::detail::q5_linear_add_schedule_name(plan.schedule),
                     [&](cudaStream_t launch_stream) { launch(tokens, launch_stream); });
         }

@@ -128,6 +128,8 @@ void HttpServer::log_request_start(const RequestLogContext& context) {
 
 void HttpServer::log_request_done(const RequestLogContext& context,
                                   const GenerationOutcome& outcome) {
+    const std::string warning = format_output_recovery_warning(context, outcome);
+    if (!warning.empty()) { write_console_log(ConsoleLogLevel::Warning, warning); }
     log_line(format_request_done(context, outcome));
     request_jsonl_.write_request_done(context, outcome);
 }

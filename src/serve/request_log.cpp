@@ -327,6 +327,20 @@ std::string format_request_error(const RequestLogContext& context, const std::st
     return out.str();
 }
 
+std::string format_output_recovery_warning(const RequestLogContext& context,
+                                           const GenerationOutcome& outcome) {
+    if (outcome.output_diagnostics.utf8_replacements == 0) { return {}; }
+    std::ostringstream out;
+    out << "[req " << context.id << "] warning generated_utf8_repaired replacements="
+        << outcome.output_diagnostics.utf8_replacements
+        << " action=replace_with_U+FFFD serving=continued sampler=["
+        << sampler_str(context.sampling) << ']';
+    for (const auto& example : outcome.output_diagnostics.utf8_repair_examples) {
+        out << " {" << example << '}';
+    }
+    return out.str();
+}
+
 std::string format_throughput(const ThroughputReport& report) {
     const double prefill_rate =
         report.interval_seconds > 0.0
@@ -465,6 +479,15 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
         {"vision", outcome.metrics.vision_seconds},   {"prefill", outcome.metrics.prefill_seconds},
         {"decode", outcome.metrics.decode_seconds},   {"total", outcome.metrics.total_seconds}};
     record["speculative"] = speculative_json(outcome.metrics);
+    record["output_diagnostics"] = {
+        {"utf8_replacements", outcome.output_diagnostics.utf8_replacements},
+        {"utf8_repair_examples", outcome.output_diagnostics.utf8_repair_examples}};
+    if (outcome.output_diagnostics.utf8_replacements != 0) {
+        record["warnings"] = Json::array({{
+            {"code", "generated_utf8_repaired"},
+            {"action", "replace_with_U+FFFD"},
+            {"serving_continued", true}}});
+    }
     return record.dump();
 }
 

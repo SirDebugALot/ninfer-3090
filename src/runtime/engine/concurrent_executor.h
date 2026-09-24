@@ -9,6 +9,8 @@
 #include "runtime/generation/generation_budget.h"
 #include "targets/qwen3_6/export/ninfer/targets/qwen3_6/frontend.h"
 
+#include <cuda_runtime.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -22,8 +24,10 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -55,7 +59,23 @@ public:
             admission_capacity_.main_kv_pages == 0) {
             throw std::logic_error("target admission capacity does not match the Engine");
         }
-        worker_ = std::thread([this] { worker_loop(); });
+        worker_ = std::thread([this, device = options.device] {
+            try {
+                // CUDA device selection is thread-local and is not inherited from the Engine's
+                // construction thread. Bind once before kernels or its cuBLAS handle are used.
+                const cudaError_t status = cudaSetDevice(device);
+                if (status != cudaSuccess) {
+                    throw std::runtime_error(std::string("worker cudaSetDevice failed: ") +
+                                             cudaGetErrorString(status));
+                }
+                worker_loop();
+            } catch (...) {
+                // Publish failure under the same serialization as ordinary worker errors.
+                // fail_all completes already-queued submissions and rejects subsequent ones.
+                std::scoped_lock execution_lock(execution_mutex_);
+                fail_all(std::current_exception());
+            }
+        });
     }
 
     ~ConcurrentExecutor() noexcept {
@@ -431,6 +451,7 @@ private:
         result.content                 = std::move(request->content);
         result.reasoning               = std::move(request->reasoning);
         result.reasoning_tokens        = request->output.reasoning_tokens();
+        result.output_diagnostics      = request->output.output_diagnostics();
         result.finish_reason           = reason;
         result.timings.prepare_seconds = request->prepare_seconds;
         if (request->begin) {
@@ -466,6 +487,14 @@ private:
         complete_success(request, FinishReason::Cancelled);
     }
 
+    OutputDecision preview_generated_tokens(const std::shared_ptr<Request>& request,
+                                              std::span<const TokenId> tokens) {
+        // The frontend repairs malformed generated UTF-8 transactionally. Other
+        // exceptions still propagate: never conceal a CUDA or internal state fault.
+        return request->output.preview(tokens, request->budget->remaining(),
+                                       request->budget->limit_reason());
+    }
+
     bool resolve_round(const std::shared_ptr<Request>& request, TokenId token,
                        bool cancel_at_boundary) {
         const std::uint32_t lane = *request->lane;
@@ -478,8 +507,7 @@ private:
         }
 
         const std::span<const TokenId> tokens(&token, 1);
-        const OutputDecision decision = request->output.preview(
-            tokens, request->budget->remaining(), request->budget->limit_reason());
+        const OutputDecision decision = preview_generated_tokens(request, tokens);
         if (decision.accepted_tokens != 1) {
             throw std::logic_error("prefill output policy did not accept its licensed token");
         }
@@ -1023,8 +1051,7 @@ private:
                 finish_reasons[row] = FinishReason::Cancelled;
                 continue;
             }
-            const OutputDecision decision = request->output.preview(
-                row_tokens, request->budget->remaining(), request->budget->limit_reason());
+            const OutputDecision decision = preview_generated_tokens(request, row_tokens);
             if (decision.accepted_tokens == 0 || decision.accepted_tokens > count ||
                 (!decision.finished() && decision.accepted_tokens != count)) {
                 throw std::logic_error("output policy returned an invalid licensed prefix");

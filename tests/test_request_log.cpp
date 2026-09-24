@@ -252,6 +252,30 @@ int main() {
 
     const Json error =
         Json::parse(format_request_error_json("serve-test", 4000, context, "generation failed"));
+    failures += check(done.at("output_diagnostics").at("utf8_replacements") == 0 &&
+                          done.at("output_diagnostics").at("utf8_repair_examples").empty() &&
+                          !done.contains("warnings") &&
+                          format_output_recovery_warning(context, outcome).empty(),
+                      "valid generated output acquired a repair warning");
+    GenerationOutcome repaired = outcome;
+    repaired.output_diagnostics.utf8_replacements = 11;
+    repaired.output_diagnostics.utf8_repair_examples = {
+        "reason=invalid_leading_byte token_id=11 token_index=64 byte_window_hex=B8"};
+    const Json recovered = Json::parse(format_request_done_json("serve-test", 3500, context, repaired));
+    failures += check(recovered.at("event") == "request_done" &&
+                          recovered.at("schema_version") == kRequestLogSchemaVersion &&
+                          recovered.at("output_diagnostics").at("utf8_replacements") == 11 &&
+                          recovered.at("output_diagnostics").at("utf8_repair_examples").at(0) ==
+                              repaired.output_diagnostics.utf8_repair_examples.front() &&
+                          recovered.at("warnings").at(0).at("code") == "generated_utf8_repaired" &&
+                          recovered.at("warnings").at(0).at("serving_continued") == true,
+                      "repaired generation lost its success status or warning diagnostics");
+    const std::string warning = format_output_recovery_warning(context, repaired);
+    failures += check(warning.find("[req 7] warning generated_utf8_repaired") != std::string::npos &&
+                          warning.find("replacements=11") != std::string::npos &&
+                          warning.find("byte_window_hex=B8") != std::string::npos &&
+                          warning.find("replace_with_U+FFFD") != std::string::npos,
+                      "operator warning omitted repair identity or details");
     failures += check(error.at("event") == "request_error", "request error event mismatch");
     failures += check(error.at("error").at("message") == "generation failed",
                       "request error message missing");

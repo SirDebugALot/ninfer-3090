@@ -1,5 +1,29 @@
 # NInfer-3090
 
+> **RTX 3090 faster-prefill branch:** `rtx3090-faster-prefill`
+> Based on `v0.6.1-rtx3090`, with the accepted Round 11 SM86 prefill
+> optimizations and the later generated-UTF-8 serving recovery.
+
+## Faster Qwen3.8-27B prefill on RTX 3090
+
+This branch specializes the Q4/Q5 prefill paths for GA102/SM86. A balanced
+fresh-process A/B/B/A comparison on the local RTX 3090 measured **785.03 tok/s**
+for the official v0.6.1 Windows binary and **1,037.43 tok/s** for the accepted
+Round 11 build at 32K input: **+32.15%**. The strict comparison uses INT8 KV,
+the newest KV format supported by both binaries; the official benchmark does
+not support RK8V4.
+
+The main retained changes are a CUDA-12.6-compiled aligned Q4 SwiGLU path with
+wider per-warp token reuse, target-specific Q4/Q5 projection routes using
+cuBLAS where it is faster, and SM86 attention/dequantization scheduling changes.
+MTP3, CUDA Graphs, model precision and the 64K shared KV configuration remain
+enabled. See the [short optimization summary](docs/rtx-3090-faster-prefill.md).
+
+Windows users can download a ZIP from GitHub Releases. Maintainers can build
+the same ZIP with the included
+[`Windows RTX 3090 prefill release`](.github/workflows/windows-prefill-release.yml)
+workflow. Model weights are never included in the repository or release archive.
+
 NInfer-3090 is a specialized C++20/CUDA inference engine for **Qwen3.8-27B** and Qwen3.6 on one
 24 GB NVIDIA GeForce RTX 3090. Qwen3.8-27B is a first-class, tested target: the native SM86
 runtime loads its official groupwise `.ninfer` artifact, serves OpenAI- and Anthropic-compatible

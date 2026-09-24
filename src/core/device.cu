@@ -33,6 +33,23 @@ void destroy_event(cudaEvent_t& event) noexcept {
     }
 }
 
+void check_blas(cublasStatus_t status, const char* operation) {
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error(std::string(operation) + ": cuBLAS status " +
+                                 std::to_string(static_cast<int>(status)));
+    }
+}
+
+void destroy_blas(cublasHandle_t& handle) noexcept {
+    if (handle != nullptr) {
+        const cublasStatus_t status = cublasDestroy(handle);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            std::fprintf(stderr, "cuBLAS cleanup failed: status %d\n", static_cast<int>(status));
+        }
+        handle = nullptr;
+    }
+}
+
 } // namespace
 
 void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
@@ -76,31 +93,54 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
             cuda_error_message("cudaStreamCreateWithFlags(load_stream) failed", err));
     }
 
+    cublasHandle_t compute_blas = nullptr;
+    try {
+        check_blas(cublasCreate(&compute_blas), "cublasCreate");
+        check_blas(cublasSetStream(compute_blas, compute), "cublasSetStream");
+        check_blas(cublasSetPointerMode(compute_blas, CUBLAS_POINTER_MODE_HOST),
+                   "cublasSetPointerMode");
+        check_blas(cublasSetMathMode(compute_blas,
+                                     CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION),
+                   "cublasSetMathMode");
+        check_blas(cublasSetAtomicsMode(compute_blas, CUBLAS_ATOMICS_NOT_ALLOWED),
+                   "cublasSetAtomicsMode");
+        // Disable the default scratch pool. Each Op must install its own scoped workspace.
+        check_blas(cublasSetWorkspace(compute_blas, nullptr, 0), "cublasSetWorkspace");
+    } catch (...) {
+        destroy_blas(compute_blas);
+        destroy_stream(load);
+        destroy_stream(compute);
+        throw;
+    }
     stream      = compute;
     load_stream = load;
+    blas        = compute_blas;
 }
 
 DeviceContext::~DeviceContext() {
-    if (stream != nullptr || load_stream != nullptr) {
+    if (stream != nullptr || load_stream != nullptr || blas != nullptr) {
         log_cuda_error("cudaSetDevice", cudaSetDevice(device));
     }
+    destroy_blas(blas);
     destroy_stream(load_stream);
     destroy_stream(stream);
 }
 
 DeviceContext::DeviceContext(DeviceContext&& other) noexcept
     : device(other.device), stream(other.stream), load_stream(other.load_stream),
-      props(other.props) {
+      blas(other.blas), props(other.props) {
     other.stream      = nullptr;
     other.load_stream = nullptr;
+    other.blas        = nullptr;
 }
 
 DeviceContext& DeviceContext::operator=(DeviceContext&& other) noexcept {
     if (this == &other) { return *this; }
 
-    if (stream != nullptr || load_stream != nullptr) {
+    if (stream != nullptr || load_stream != nullptr || blas != nullptr) {
         log_cuda_error("cudaSetDevice", cudaSetDevice(device));
     }
+    destroy_blas(blas);
     destroy_stream(load_stream);
     destroy_stream(stream);
 
@@ -108,9 +148,11 @@ DeviceContext& DeviceContext::operator=(DeviceContext&& other) noexcept {
     props       = other.props;
     stream      = other.stream;
     load_stream = other.load_stream;
+    blas        = other.blas;
 
     other.stream      = nullptr;
     other.load_stream = nullptr;
+    other.blas        = nullptr;
     return *this;
 }
 

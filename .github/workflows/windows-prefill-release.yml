@@ -1,0 +1,98 @@
+name: Windows RTX 3090 prefill release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*-rtx3090-prefill*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Enable the Visual Studio build environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install CUDA 13.2 for the main build
+        id: cuda132
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: '13.2.0'
+          log-file-suffix: 'cuda-13.2.txt'
+
+      - name: Install CUDA 12.6 for the aligned Q4 kernel
+        id: cuda126
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: '12.6.3'
+          log-file-suffix: 'cuda-12.6.txt'
+
+      - name: Install the pinned vcpkg baseline
+        shell: pwsh
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
+          git -C C:\vcpkg checkout 4bca8fd8654e5ba76f92661db7bfe954768ad8ef
+          C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+
+      - name: Configure the SM86 Release build
+        shell: pwsh
+        run: |
+          $cuda132 = '${{ steps.cuda132.outputs.CUDA_PATH }}'
+          $cuda126 = '${{ steps.cuda126.outputs.CUDA_PATH }}'
+          cmake -S . -B build-prefill-windows -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_CUDA_ARCHITECTURES=86 `
+            -DCMAKE_CUDA_COMPILER="$cuda132/bin/nvcc.exe" `
+            -DCUDAToolkit_ROOT="$cuda132" `
+            -DNINFER_CUBLAS_ROOT="$cuda132" `
+            -DNINFER_Q4_FULL_NVCC="$cuda126/bin/nvcc.exe" `
+            -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake `
+            -DVCPKG_TARGET_TRIPLET=x64-windows `
+            -DNINFER_BUILD_APPS=ON `
+            -DNINFER_BUILD_BENCHMARKS=ON `
+            -DBUILD_TESTING=OFF
+
+      - name: Build CLI, server and benchmark
+        run: cmake --build build-prefill-windows --target ninfer ninfer-serve ninfer_bench --parallel 4
+
+      - name: Package the Windows ZIP
+        shell: pwsh
+        run: |
+          $label = if ('${{ github.ref_type }}' -eq 'tag') { '${{ github.ref_name }}' } else { 'manual-${{ github.run_number }}' }
+          ./scripts/package-prefill-windows.ps1 `
+            -BuildRoot build-prefill-windows `
+            -ReleaseLabel $label `
+            -CudaRoot '${{ steps.cuda132.outputs.CUDA_PATH }}'
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ninfer-rtx3090-faster-prefill-windows-${{ github.run_number }}
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS-*.txt
+          if-no-files-found: error
+
+      - name: Attach files to the GitHub Release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ github.ref_name }}'
+          if (gh release view $tag 2>$null) {
+            gh release upload $tag dist/*.zip dist/SHA256SUMS-*.txt --clobber
+          } else {
+            gh release create $tag `
+              --title "NInfer RTX 3090 - Faster Prefill $tag" `
+              --notes-file RELEASE_NOTES_PREFILL.md `
+              dist/*.zip dist/SHA256SUMS-*.txt
+          }

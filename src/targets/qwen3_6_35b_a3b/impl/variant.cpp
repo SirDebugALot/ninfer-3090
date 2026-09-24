@@ -133,7 +133,8 @@ void Variant::attention_projection(const Tensor& hidden,
 
 void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,
                                           Tensor& residual, qwen3_6::TextPhase,
-                                          WorkspaceArena& workspace, cudaStream_t stream) {
+                                          WorkspaceArena& workspace, cudaStream_t stream,
+                                          cublasHandle_t) {
     ops::linear_add(attention, weight, residual, workspace, stream);
 }
 
@@ -166,7 +167,7 @@ void Variant::mtp_q_gate_projection(const Tensor& hidden,
 
 void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
                                    Tensor& qkv, Tensor& output_gate, qwen3_6::TextPhase,
-                                   WorkspaceArena&, cudaStream_t stream) {
+                                   WorkspaceArena&, cudaStream_t stream, cublasHandle_t) {
     Tensor output_gate_flat =
         output_gate.view({TextConfig::value_dim, static_cast<int>(hidden.ne[1] * hidden.ne[2])});
     ops::gdn_input_proj(hidden, weights.query_key_value_z, qkv, output_gate_flat, stream);
@@ -200,7 +201,7 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
 
 void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
                                     qwen3_6::TextPhase, WorkspaceArena& workspace,
-                                    cudaStream_t stream) {
+                                    cudaStream_t stream, cublasHandle_t) {
     ops::linear_add(hidden, weight, residual, workspace, stream);
 }
 
@@ -213,7 +214,8 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
 }
 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
-                         qwen3_6::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
+                         qwen3_6::TextPhase, WorkspaceArena& workspace, cudaStream_t stream,
+                         cublasHandle_t) {
     run_sparse_moe(hidden, weights.op, residual, workspace, stream);
 }
 

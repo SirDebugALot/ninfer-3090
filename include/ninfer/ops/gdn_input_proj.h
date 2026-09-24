@@ -7,6 +7,7 @@
 #include "ninfer/ops/linear.h"
 
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -37,10 +38,27 @@ namespace ninfer::ops {
  *   Writes the full qkv and z outputs; inputs and outputs must not alias.
  *
  * Workspace:
- *   No transient bytes are required.
+ *   The convenience overload uses the native zero-workspace route. The resource-bearing
+ *   overload may use caller-owned call-scoped storage sized by the two-parent capacity query
+ *   below. A null cuBLAS handle retains the native route. The handle must belong to the
+ *   selected device/stream and be configured for host scalars and FP32 reduction without
+ *   reduced-precision reduction; it is caller-owned and created before graph capture.
+ *   The caller must serialize use and configuration of this handle. Arena storage stays
+ *   live until the queued work completes; reuse must be ordered on the same stream or
+ *   explicitly synchronized. Restoring the arena cursor does not synchronize the device.
  */
 void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                     Tensor& qkv, Tensor& z, cudaStream_t stream);
+
+/** Capacity for the exact two-parent Q4/Q5 profile over an inclusive positive T interval. */
+[[nodiscard]] std::size_t gdn_input_proj_workspace_capacity_bytes(
+    std::int32_t input_rows, std::int32_t qk_rows, std::int32_t value_z_rows,
+    std::int32_t min_tokens, std::int32_t max_tokens);
+
+/** Same represented inputs and outputs; workspace is restored after the asynchronous call. */
+void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                    Tensor& qkv, Tensor& z, WorkspaceArena& workspace, cudaStream_t stream,
+                    cublasHandle_t blas);
 
 /**
  * Single-parent GDN projection. Registered parent forms are:

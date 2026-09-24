@@ -1,6 +1,8 @@
 #include "ops/linear_add/linear_add_test_common.h"
 
 #include "ninfer/ops/linear_add.h"
+#include "core/decode_graph.h"
+#include "core/device.h"
 #include "ops/direct_bf16_weight.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
@@ -290,6 +292,7 @@ std::vector<float> materialize_weight_rows(const HostWeight& weight,
 bool cuda_available() { return !test::cuda_unavailable(); }
 
 int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shape) {
+    DeviceContext context;
     const std::vector<std::int32_t> tokens = conformance_tokens(shape);
     if (tokens.empty()) { throw std::invalid_argument("linear_add test: no token cases"); }
     const std::int32_t maximum_t = tokens.back();
@@ -322,6 +325,7 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
         const std::size_t output_words = checked_elements(shape.n, t, "output");
         test::GuardedDeviceBuffer output(output_words * sizeof(std::uint16_t));
         output.copy_from_host(residual.data(), output.bytes());
+        test::cuda_check(cudaDeviceSynchronize(), "finish LinearAdd fixture uploads");
 
         Tensor input(device_activation.data(), DType::BF16, {shape.k, t});
         Tensor residual_out(output.data(), DType::BF16, {shape.n, t});
@@ -331,7 +335,7 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
         const std::string case_label = std::string(label) + " [" + std::to_string(shape.n) + "," +
                                        std::to_string(shape.k) + "] T=" + std::to_string(t);
         try {
-            ops::linear_add(input, weight, residual_out, workspace, nullptr);
+            ops::linear_add(input, weight, residual_out, workspace, context.stream, context.blas);
             test::cuda_check(cudaDeviceSynchronize(), "synchronize linear_add");
         } catch (const std::exception& error) {
             std::cerr << case_label << ": unexpected exception: " << error.what() << '\n';
@@ -356,6 +360,46 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
             std::span<const double>(
                 full_reference.data(),
                 checked_elements(static_cast<std::int32_t>(oracle_rows.size()), t, "reference")));
+
+        if (format == WeightFormat::Q5G64F16S && t == 1024) {
+            // The eager call above warms library code before capture. Reuse the same stable
+            // operands/arena and reset residual before capture and every replay: beta=1 must
+            // implement one LinearAdd, not accumulate results from previous invocations.
+            output.copy_from_host(residual.data(), output.bytes());
+            test::cuda_check(cudaDeviceSynchronize(), "finish capture residual reset");
+            workspace.reset();
+            workspace.reset_peak();
+            DecodeGraphDefinition definition;
+            DecodeGraphExecutable executable;
+            definition.capture(context.stream, [&] {
+                ops::linear_add(input, weight, residual_out, workspace, context.stream,
+                                context.blas);
+            });
+            executable.instantiate(definition);
+            if (workspace.used() != 0 || workspace.peak_used() != exact_workspace) {
+                std::cerr << case_label << ": graph capture workspace high-water mismatch\n";
+                ++failures;
+            }
+            for (int replay = 0; replay < 2; ++replay) {
+                output.copy_from_host(residual.data(), output.bytes());
+                test::cuda_check(cudaDeviceSynchronize(), "finish replay residual reset");
+                executable.launch(context.stream);
+                test::cuda_check(cudaStreamSynchronize(context.stream),
+                                 "synchronize LinearAdd graph replay");
+                const std::string graph_label = case_label + " graph replay=" +
+                                                std::to_string(replay);
+                failures += output.verify_guards(graph_label.c_str());
+                const OutputRead graph_actual = read_output(
+                    output.data(), shape.n, t, oracle_rows, columns, graph_label);
+                failures += graph_actual.failures;
+                failures += compare_output(
+                    graph_label, graph_actual.selected,
+                    std::span<const double>(
+                        full_reference.data(),
+                        checked_elements(static_cast<std::int32_t>(oracle_rows.size()), t,
+                                         "graph reference")));
+            }
+        }
     }
     if (executed_peak != workspace_bytes) {
         std::cerr << label << ": interval workspace capacity has no executed high-water witness\n";

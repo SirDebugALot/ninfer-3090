@@ -127,6 +127,28 @@ cmake --build build-windows --config Release --parallel
 The source rejects unsupported CUDA architectures for this fork. CUDA 13 uses MSVC's conforming
 preprocessor automatically.
 
+### Experimental compiler selection for Q4 prefill
+
+Windows/MSVC SM86 single-config Release builds can optionally compile the aligned Q4 SwiGLU
+prefill kernel with CUDA 12.6 while retaining the main CUDA toolkit, runtime, and device linker.
+From an initialized Visual Studio x64 developer environment, add this CMake cache option to a
+Ninja Release configuration alongside its existing toolkit/vcpkg settings:
+
+```text
+-DNINFER_Q4_FULL_NVCC="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.6/bin/nvcc.exe"
+```
+
+The option is empty/off by default and is not a system CUDA downgrade. Only Q4 calls with at least
+1,024 tokens and a token count divisible by 128 use the separately named CUDA 12.6 kernel. Short
+calls, decode/MTP, and all tail shapes retain the main compiler because the CUDA 12.6 tail kernel
+was slower. The aligned auxiliary kernel now uses direct MMA weight fragments and a WN32 tile;
+it preserves the represented arithmetic, storage, and zero-workspace contract, but is no longer
+just a separately compiled copy of the main kernel. See the
+[short RTX 3090 prefill summary](rtx-3090-faster-prefill.md) for the retained implementation and evidence.
+The auxiliary object uses the inherited MSVC environment and a header depfile for incremental
+rebuilds; changing its headers regenerates it. Clear `NINFER_Q4_FULL_NVCC` to disable the route.
+Qualify the public Q4 Op and end-to-end prefill on the selected hardware before deploying it.
+
 ## Release validation
 
 The v0.5 Windows release gate rebuilt `ninfer.exe`, `ninfer-serve.exe`, and `ninfer_bench.exe`,

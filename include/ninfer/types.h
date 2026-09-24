@@ -352,6 +352,13 @@ enum class PrefixReusePath : std::uint8_t {
     RestoreTurnCheckpoint,
 };
 
+// Generated text recovery does not alter logical tokens or GPU state. Examples
+// contain bounded ASCII diagnostics, not input prompts; at most eight are kept.
+struct OutputDiagnostics {
+    std::uint64_t utf8_replacements = 0;
+    std::vector<std::string> utf8_repair_examples;
+};
+
 struct GenerationResult {
     PromptSummary prompt;
     std::vector<TokenId> generated_token_ids;
@@ -363,6 +370,7 @@ struct GenerationResult {
     PrefixReusePath prefix_reuse_path  = PrefixReusePath::FullReset;
     GenerationTimings timings;
     SpeculativeStats speculative;
+    OutputDiagnostics output_diagnostics;
 };
 
 struct ArenaMemorySummary {

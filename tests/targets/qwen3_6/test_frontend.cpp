@@ -7,6 +7,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -100,7 +101,13 @@ FrontendResources resources(const std::string& chat_template = thinking_toggle_t
     result.tokenizer_json = nlohmann::json{
         {"model",
          {{"type", "BPE"},
-          {"vocab", {{"x", 0}, {"ä", 10}, {"¸", 11}, {"Ń", 12}}},
+          {"vocab",
+           {{"x", 0}, {"ä", 10}, {"¸", 11}, {"Ń", 12}, {"À", 13}, {"ÿ", 14},
+            {"â", 15}, {"Ĥ", 16}, {"ð", 17}, {"Ł", 18}, {"ĺ", 19}, {"Ģ", 20},
+            {"à", 21}, {"í", 22}, {"ł", 23}, {"ô", 24}, {"Ĳ", 25}, {"õ", 26},
+            {"Â", 27}, {"ß", 28}, {"¿", 29}, {"äx", 40}, {"ä¸x", 41},
+            {"âä¸Ń", 42}, {"helloÿST", 43}, {"OPtailÿ", 44}, {"ķ", 45}, {"ľ", 46},
+            {"ê", 47}, {"½", 49}, {"Á", 51}, {"î", 52}, {"ï", 53}, {"ı", 54}}},
           {"merges", nlohmann::json::array()}}},
         {"added_tokens",
          tokens}}.dump();
@@ -801,6 +808,299 @@ int test_utf8_and_hidden_eos(const Frontend& frontend) {
     return failures;
 }
 
+int test_malformed_generated_utf8(const Frontend& frontend) {
+    const std::string replacement = "\xef\xbf\xbd";
+    struct Example {
+        const char* name;
+        std::vector<ninfer::TokenId> tokens;
+        std::string expected;
+        std::uint64_t repairs;
+    };
+    // Byte-level BPE tokens are valid vocabulary entries even when their decoded bytes
+    // are malformed UTF-8. Expected text follows Unicode maximal-subpart replacement.
+    const std::vector<Example> examples{
+        {"orphan continuation", {11, 0}, replacement + "x", 1},
+        {"invalid leading bytes", {13, 51, 14, 26, 0},
+         replacement + replacement + replacement + replacement + "x", 4},
+        {"malformed second byte", {10, 0}, replacement + "x", 1},
+        {"malformed third byte", {10, 11, 0}, replacement + "x", 1},
+        {"malformed fourth byte", {17, 18, 19, 0}, replacement + "x", 1},
+        {"valid codepoint after malformed prefix", {15, 10, 11, 12}, replacement + "中", 1},
+        {"overlong three-byte codepoint", {21, 20, 20, 0},
+         replacement + replacement + replacement + "x", 3},
+        {"overlong four-byte codepoint", {17, 54, 29, 29, 0},
+         replacement + replacement + replacement + replacement + "x", 4},
+        {"surrogate codepoint", {22, 23, 20, 0}, replacement + replacement + replacement + "x", 3},
+        {"out-of-range codepoint", {24, 25, 20, 20, 0},
+         replacement + replacement + replacement + replacement + "x", 4},
+        {"incomplete two-byte suffix", {0, 27}, "x" + replacement, 1},
+        {"incomplete three-byte suffix", {0, 10, 11}, "x" + replacement, 1},
+        {"incomplete four-byte suffix", {0, 17, 18, 19}, "x" + replacement, 1},
+        {"malformed prefix followed by illegal lead", {10, 11, 14, 0},
+         replacement + replacement + "x", 2},
+        {"same-token malformed second byte", {40}, replacement + "x", 1},
+        {"same-token malformed third byte", {41}, replacement + "x", 1},
+        {"same-token valid codepoint after malformed prefix", {42}, replacement + "中", 1},
+        {"valid two-byte boundaries", {27, 20, 28, 29}, "\xc2\x80\xdf\xbf", 0},
+        {"valid three-byte boundaries", {21, 23, 20, 22, 18, 29, 52, 20, 20, 53, 29, 29},
+         "\xe0\xa0\x80\xed\x9f\xbf\xee\x80\x80\xef\xbf\xbf", 0},
+        {"valid four-byte boundaries", {17, 25, 20, 20, 24, 54, 29, 29},
+         "\xf0\x90\x80\x80\xf4\x8f\xbf\xbf", 0},
+        {"valid four-byte codepoint", {17, 18, 19, 20}, "\xf0\x9f\x98\x80", 0},
+        {"literal replacement character", {53, 29, 49}, replacement, 0},
+        {"valid Korean text", {22, 45, 46, 47, 11, 20}, "한글", 0},
+    };
+    int failures = 0;
+    for (const Example& example : examples) {
+        for (const bool single_token_rounds : {false, true}) {
+            auto prompt  = frontend.prepare_tokens({0});
+            auto session = frontend.make_output_session(prompt, {});
+            std::string actual;
+            try {
+                std::size_t offset = 0;
+                while (offset < example.tokens.size()) {
+                    const auto count = single_token_rounds ? 1 : example.tokens.size() - offset;
+                    const auto remaining = static_cast<std::uint32_t>(example.tokens.size() - offset);
+                    const auto before = session.output_diagnostics();
+                    const auto decision = session.preview(
+                        std::span<const ninfer::TokenId>(example.tokens).subspan(offset, count),
+                        remaining, ninfer::FinishReason::OutputLimit);
+                    failures += check(decision.accepted_tokens == count &&
+                                          decision.finish_reason ==
+                                              (count == remaining ? ninfer::FinishReason::OutputLimit
+                                                                  : ninfer::FinishReason::None),
+                                      "UTF-8 replacement changed accepted token accounting");
+                    failures += check(session.output_diagnostics().utf8_replacements ==
+                                          before.utf8_replacements &&
+                                          session.output_diagnostics().utf8_repair_examples ==
+                                              before.utf8_repair_examples,
+                                      "uncommitted UTF-8 diagnostics became visible");
+                    actual += channel_text(session.commit_preview(), ninfer::OutputChannel::Content);
+                    offset += count;
+                }
+                if (actual != example.expected) {
+                    std::cerr << example.name << ": generated UTF-8 replacement differs ("
+                              << (single_token_rounds ? "single-token" : "multi-token")
+                              << " rounds)\n";
+                    ++failures;
+                }
+                failures += check(session.output_diagnostics().utf8_replacements == example.repairs,
+                                  "UTF-8 maximal-subpart replacement count differs");
+                failures += check(session.output_diagnostics().utf8_repair_examples.size() ==
+                                      std::min<std::uint64_t>(example.repairs, 8),
+                                  "UTF-8 repair example count differs");
+            } catch (const std::exception& error) {
+                std::cerr << example.name << ": generated UTF-8 decoding threw: "
+                          << error.what() << '\n';
+                ++failures;
+            }
+        }
+    }
+    return failures;
+}
+
+int test_utf8_preview_transaction(const Frontend& frontend) {
+    auto prompt  = frontend.prepare_tokens({0});
+    auto session = frontend.make_output_session(prompt, {});
+    int failures = 0;
+    (void)session.preview(std::array<ninfer::TokenId, 1>{10}, 8,
+                          ninfer::FinishReason::OutputLimit);
+    failures += check(session.commit_preview().empty(), "UTF-8 lead byte was published early");
+    bool rejected = false;
+    try {
+        // The malformed prefix is repaired only in preview state before the invalid ID.
+        (void)session.preview(std::array<ninfer::TokenId, 3>{11, 14, -1}, 7,
+                              ninfer::FinishReason::OutputLimit);
+    } catch (const std::out_of_range&) {
+        rejected = true;
+    } catch (const std::exception& error) {
+        std::cerr << "UTF-8 preview transaction threw before invalid token ID: "
+                  << error.what() << '\n';
+        return failures + 1;
+    }
+    failures += check(rejected, "invalid generated token ID was accepted");
+    failures += check(session.output_diagnostics().utf8_replacements == 0 &&
+                          session.output_diagnostics().utf8_repair_examples.empty(),
+                      "failed UTF-8 preview changed committed diagnostics");
+    const auto recovered = session.preview(std::array<ninfer::TokenId, 2>{11, 12}, 7,
+                                           ninfer::FinishReason::OutputLimit);
+    failures += check(recovered.accepted_tokens == 2 && !recovered.finished(),
+                      "failed UTF-8 preview changed subsequent token accounting");
+    failures += check(channel_text(session.commit_preview(), ninfer::OutputChannel::Content) == "中",
+                      "failed UTF-8 preview mutated the committed pending bytes");
+    failures += check(session.output_diagnostics().utf8_replacements == 0 &&
+                          session.output_diagnostics().utf8_repair_examples.empty(),
+                      "recovered UTF-8 preview retained diagnostics from failed speculation");
+    return failures;
+}
+
+int test_repaired_utf8_stop_semantics(const Frontend& frontend) {
+    const std::string replacement = "\xef\xbf\xbd";
+    auto prompt = frontend.prepare_tokens({0});
+    int failures = 0;
+    try {
+        ninfer::StopPolicy stop;
+        stop.strings.push_back(ninfer::StopString{.text = "STOP"});
+        auto session = frontend.make_output_session(prompt, stop);
+        const auto first = session.preview(std::array<ninfer::TokenId, 1>{43}, 5,
+                                            ninfer::FinishReason::OutputLimit);
+        failures += check(first.accepted_tokens == 1 && !first.finished(),
+                          "repaired output ended before a cross-round stop was complete");
+        failures += check(channel_text(session.commit_preview(), ninfer::OutputChannel::Content) ==
+                              "hello" + replacement,
+                          "repaired output lost text or published an ambiguous stop suffix");
+        const auto second = session.preview(std::array<ninfer::TokenId, 3>{44, 14, -1}, 4,
+                                             ninfer::FinishReason::OutputLimit);
+        failures += check(second.accepted_tokens == 1 &&
+                              second.finish_reason == ninfer::FinishReason::StopString,
+                          "repaired stop did not select the exact speculative token prefix");
+        failures += check(session.commit_preview().empty(),
+                          "repaired stop leaked a marker or rejected speculative suffix");
+
+        stop.strings = {ninfer::StopString{.text = replacement}};
+        auto replacement_stop = frontend.make_output_session(prompt, stop);
+        const auto stopped = replacement_stop.preview(std::array<ninfer::TokenId, 2>{14, -1}, 3,
+                                                       ninfer::FinishReason::OutputLimit);
+        failures += check(stopped.accepted_tokens == 1 &&
+                              stopped.finish_reason == ninfer::FinishReason::StopString,
+                          "stop matching did not see repaired Unicode text");
+        failures += check(replacement_stop.commit_preview().empty(),
+                          "excluded replacement stop marker was published");
+
+        ninfer::StopPolicy token_stop;
+        token_stop.token_ids = {14};
+        for (const bool raw : {false, true}) {
+            auto token_session = frontend.make_output_session(
+                prompt, token_stop, ninfer::OutputOptions{.raw = raw});
+            const auto terminal = token_session.preview(std::array<ninfer::TokenId, 2>{10, 14}, 3,
+                                                         ninfer::FinishReason::OutputLimit);
+            failures += check(terminal.accepted_tokens == 2 &&
+                                  terminal.finish_reason == ninfer::FinishReason::StopToken,
+                              "malformed stop token changed the accepted terminal prefix");
+            const std::string expected = raw ? replacement + replacement : replacement;
+            failures += check(channel_text(token_session.commit_preview(),
+                                             ninfer::OutputChannel::Content) == expected,
+                              "hidden stop-token rollback or raw publication lost UTF-8 state");
+            failures += check(token_session.output_diagnostics().utf8_replacements == (raw ? 2 : 1) &&
+                                  token_session.output_diagnostics().utf8_repair_examples.size() ==
+                                      (raw ? 2 : 1),
+                              "hidden stop-token rollback did not restore UTF-8 diagnostics");
+        }
+    } catch (const std::exception& error) {
+        std::cerr << "repaired UTF-8 stop semantics threw: " << error.what() << '\n';
+        ++failures;
+    }
+    return failures;
+}
+
+int test_utf8_diagnostics(const Frontend& frontend) {
+    auto prompt = frontend.prepare_tokens({0});
+    auto session = frontend.make_output_session(prompt, {});
+    const std::vector<ninfer::TokenId> malformed(10, 14);
+    const auto decision = session.preview(malformed, 12, ninfer::FinishReason::OutputLimit);
+    int failures = check(decision.accepted_tokens == 10 && !decision.finished(),
+                         "repeated malformed tokens changed accepted-token accounting");
+    failures += check(session.output_diagnostics().utf8_replacements == 0 &&
+                          session.output_diagnostics().utf8_repair_examples.empty(),
+                      "repair diagnostics were published before preview commit");
+    std::string expected;
+    for (int index = 0; index < 10; ++index) { expected += "\xef\xbf\xbd"; }
+    failures += check(channel_text(session.commit_preview(), ninfer::OutputChannel::Content) == expected,
+                      "repeated malformed tokens were not independently repaired");
+    const auto committed = session.output_diagnostics();
+    failures += check(committed.utf8_replacements == 10 && committed.utf8_repair_examples.size() == 8,
+                      "UTF-8 replacement counter or eight-example bound is incorrect");
+    for (const auto& example : committed.utf8_repair_examples) {
+        failures += check(example.find("token_id=14") != std::string::npos &&
+                              example.find("generated_token_index=") != std::string::npos &&
+                              example.find("byte_window_hex=FF") != std::string::npos,
+                          "UTF-8 repair example lacks token and byte context");
+    }
+    (void)session.preview(std::array<ninfer::TokenId, 2>{14, 14}, 2,
+                          ninfer::FinishReason::OutputLimit);
+    (void)session.commit_preview();
+    failures += check(session.output_diagnostics().utf8_replacements == 12 &&
+                          session.output_diagnostics().utf8_repair_examples ==
+                              committed.utf8_repair_examples,
+                      "UTF-8 repair counter stopped or examples exceeded the bound");
+
+    auto terminal = frontend.make_output_session(prompt, {});
+    (void)terminal.preview(std::array<ninfer::TokenId, 2>{10, 11}, 3,
+                           ninfer::FinishReason::OutputLimit);
+    failures += check(terminal.commit_preview().empty() &&
+                          terminal.output_diagnostics().utf8_replacements == 0,
+                      "still-valid incomplete UTF-8 suffix was repaired prematurely");
+    const auto cancelled = terminal.preview_terminal(ninfer::FinishReason::Cancelled);
+    failures += check(cancelled.accepted_tokens == 0 &&
+                          cancelled.finish_reason == ninfer::FinishReason::Cancelled &&
+                          terminal.output_diagnostics().utf8_replacements == 0,
+                      "terminal UTF-8 preview altered committed state");
+    failures += check(channel_text(terminal.commit_preview(), ninfer::OutputChannel::Content) ==
+                          "\xef\xbf\xbd" && terminal.output_diagnostics().utf8_replacements == 1 &&
+                          terminal.output_diagnostics().utf8_repair_examples.size() == 1,
+                      "terminal incomplete UTF-8 suffix did not record one repair");
+
+    ninfer::StopPolicy malformed_stop;
+    malformed_stop.strings.push_back(ninfer::StopString{.text = std::string(1, '\xff')});
+    failures += check(throws_invalid_argument([&] {
+                          (void)frontend.make_output_session(prompt, malformed_stop);
+                      }),
+                      "generated-byte recovery relaxed caller stop-string UTF-8 validation");
+    return failures;
+}
+
+int test_utf8_session_continuity(const Frontend& frontend) {
+    auto prompt = frontend.prepare_tokens({0});
+    auto repaired = frontend.make_output_session(prompt, {});
+    auto korean = frontend.make_output_session(prompt, {});
+    (void)repaired.preview(std::array<ninfer::TokenId, 1>{14}, 2,
+                           ninfer::FinishReason::OutputLimit);
+    int failures = check(channel_text(repaired.commit_preview(), ninfer::OutputChannel::Content) ==
+                             "\xef\xbf\xbd",
+                         "malformed stream did not recover in its own session");
+    (void)korean.preview(std::array<ninfer::TokenId, 2>{22, 45}, 6,
+                         ninfer::FinishReason::OutputLimit);
+    failures += check(korean.commit_preview().empty(), "Korean byte prefix was published early");
+    const auto continued = repaired.preview(std::array<ninfer::TokenId, 1>{0}, 1,
+                                             ninfer::FinishReason::OutputLimit);
+    failures += check(continued.accepted_tokens == 1 &&
+                          continued.finish_reason == ninfer::FinishReason::OutputLimit &&
+                          channel_text(repaired.commit_preview(), ninfer::OutputChannel::Content) == "x" &&
+                          repaired.output_diagnostics().utf8_replacements == 1,
+                      "repaired session could not continue to its ordinary output limit");
+    (void)korean.preview(std::array<ninfer::TokenId, 4>{46, 47, 11, 20}, 4,
+                         ninfer::FinishReason::OutputLimit);
+    failures += check(channel_text(korean.commit_preview(), ninfer::OutputChannel::Content) == "한글" &&
+                          korean.output_diagnostics().utf8_replacements == 0 &&
+                          korean.output_diagnostics().utf8_repair_examples.empty(),
+                      "another session's repair changed valid Korean output or diagnostics");
+    auto later = frontend.make_output_session(prompt, {});
+    (void)later.preview(std::array<ninfer::TokenId, 1>{0}, 1, ninfer::FinishReason::OutputLimit);
+    failures += check(channel_text(later.commit_preview(), ninfer::OutputChannel::Content) == "x" &&
+                          later.output_diagnostics().utf8_replacements == 0,
+                      "later frontend session retained another request's repair state");
+
+    ninfer::PromptInput thinking_input;
+    ninfer::ChatMessage message;
+    message.role = "user";
+    message.parts.push_back(ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x"});
+    thinking_input.messages.push_back(std::move(message));
+    thinking_input.options.add_generation_prompt = true;
+    thinking_input.options.enable_thinking = true;
+    auto thinking_prompt = frontend.prepare(std::move(thinking_input));
+    auto thinking = frontend.make_output_session(thinking_prompt, {});
+    (void)thinking.preview(std::array<ninfer::TokenId, 3>{11, 3, 4}, 3,
+                           ninfer::FinishReason::OutputLimit);
+    const auto output = thinking.commit_preview();
+    failures += check(channel_text(output, ninfer::OutputChannel::Reasoning) ==
+                          std::string("\xef\xbf\xbd") + "thought" &&
+                          channel_text(output, ninfer::OutputChannel::Content) == "answer" &&
+                          thinking.reasoning_tokens() == 3 &&
+                          thinking.output_diagnostics().utf8_replacements == 1,
+                      "UTF-8 repair changed reasoning-channel transitions or token usage");
+    return failures;
+}
+
 int test_disabled_vision() {
     const Frontend frontend = FrontendFactory::create_component(resources(), false);
     int failures = check(throws_invalid_argument([&] { (void)frontend.prepare(image_input()); }),
@@ -838,6 +1138,11 @@ int main() {
     failures += test_terminal_flush(frontend);
     failures += test_reasoning_split(frontend);
     failures += test_utf8_and_hidden_eos(frontend);
+    failures += test_malformed_generated_utf8(frontend);
+    failures += test_utf8_preview_transaction(frontend);
+    failures += test_repaired_utf8_stop_semantics(frontend);
+    failures += test_utf8_diagnostics(frontend);
+    failures += test_utf8_session_continuity(frontend);
     failures += test_disabled_vision();
     return failures == 0 ? 0 : 1;
 }

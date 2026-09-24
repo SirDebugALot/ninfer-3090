@@ -51,6 +51,7 @@ struct GenerationOutcome {
     std::size_t streamed_content_bytes = 0;
     ninfer::FinishReason finish_reason = ninfer::FinishReason::OutputLimit;
     GenerationMetrics metrics;
+    ninfer::OutputDiagnostics output_diagnostics;
 };
 
 struct StreamSink {

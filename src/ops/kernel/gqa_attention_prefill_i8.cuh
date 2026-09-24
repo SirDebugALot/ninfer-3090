@@ -62,14 +62,19 @@ __device__ __forceinline__ int gqa_prefill_i8_p_swz(int row, int col) {
 
 __device__ __forceinline__ int4 gqa_prefill_i8_dequant_f16x8(const std::int8_t* codes8,
                                                              __half scale) {
-    const int2 raw       = load_vec<int2>(codes8);
-    const std::int8_t* c = reinterpret_cast<const std::int8_t*>(&raw);
-    const __half2 s2     = __halves2half2(scale, scale);
+    const int2 raw   = load_vec<int2>(codes8);
+    const unsigned words[2] = {static_cast<unsigned>(raw.x) ^ 0x80808080u,
+                               static_cast<unsigned>(raw.y) ^ 0x80808080u};
+    const __half2 s2 = __halves2half2(scale, scale);
+    const __half2 bias = half2_from_bits(0x64806480u); // 1152 = 1024 + 128.
     unsigned packed[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        const __half2 code2 =
-            __floats2half2_rn(static_cast<float>(c[2 * i]), static_cast<float>(c[2 * i + 1]));
+        // The biased byte inserted into a 0x64xx half is exactly 1152 + code.
+        // Subtraction reconstructs every signed byte exactly, including -128.
+        const unsigned bits = __byte_perm(words[i / 2], 0x64646464u,
+                                           (i & 1) ? 0x4342u : 0x4140u);
+        const __half2 code2 = __hsub2(half2_from_bits(bits), bias);
         const __half2 value2 = __hmul2(code2, s2);
         packed[i]            = *reinterpret_cast<const unsigned*>(&value2);
     }
@@ -244,7 +249,7 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_i8_page_kernel
 }
 
 template <typename Geometry, bool PackedV, bool RotateK, bool RotateV, typename Metadata>
-__global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
+__global__ __maxnreg__(128) void gqa_attention_prefill_i8_kernel(
     const __nv_bfloat16* __restrict__ q, const std::int8_t* __restrict__ cache_k,
     const std::uint8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
     const __half* __restrict__ cache_v_scale, Metadata metadata,
@@ -386,15 +391,13 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     const int b_rin    = lane & 7;
     const int b_koff   = ((lane >> 3) & 1) << 3;
 
-    // Keeping exactly two group scales live is the spill-free 120-register point on SM120.
-    // Groups 2/3 reload per key tile; retaining all four creates an 8-byte stack frame.
-    float q_scale_r0[Groups - 2];
-    float q_scale_r1[Groups - 2];
+    float q_scale_r0[Groups];
+    float q_scale_r1[Groups];
     if (warp < ProducerWarps) {
         const int scale_row0 = warp * 16 + gid;
         const int scale_row1 = scale_row0 + 8;
 #pragma unroll
-        for (int grp = 0; grp < Groups - 2; ++grp) {
+        for (int grp = 0; grp < Groups; ++grp) {
             float qs0       = lid == 0 ? q_scale[scale_row0 * Groups + grp] : 0.0f;
             float qs1       = lid == 0 ? q_scale[scale_row1 * Groups + grp] : 0.0f;
             q_scale_r0[grp] = __shfl_sync(FullMask, qs0, gid * 4);
@@ -425,19 +428,8 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
 
 #pragma unroll
             for (int grp = 0; grp < Groups; ++grp) {
-                float qs0;
-                float qs1;
-                if (grp < Groups - 2) {
-                    qs0 = q_scale_r0[grp];
-                    qs1 = q_scale_r1[grp];
-                } else {
-                    const int scale_row0 = row_base + gid;
-                    const int scale_row1 = scale_row0 + 8;
-                    qs0                  = lid == 0 ? q_scale[scale_row0 * Groups + grp] : 0.0f;
-                    qs1                  = lid == 0 ? q_scale[scale_row1 * Groups + grp] : 0.0f;
-                    qs0                  = __shfl_sync(FullMask, qs0, gid * 4);
-                    qs1                  = __shfl_sync(FullMask, qs1, gid * 4);
-                }
+                const float qs0 = q_scale_r0[grp];
+                const float qs1 = q_scale_r1[grp];
 
                 unsigned af[GroupKc][4];
 #pragma unroll
@@ -465,14 +457,10 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
                     }
                     const int keya = nt * 8 + 2 * lid;
                     const int keyb = keya + 1;
-                    float ks0      = 0.0f;
-                    float ks1      = 0.0f;
-                    if (gid == 0) {
-                        ks0 = __half2float(k_scale_s[keya * Groups + grp]);
-                        ks1 = __half2float(k_scale_s[keyb * Groups + grp]);
-                    }
-                    ks0          = __shfl_sync(FullMask, ks0, lid);
-                    ks1          = __shfl_sync(FullMask, ks1, lid);
+                    // All eight four-lane row groups use the same four scale pairs.
+                    // Shared-memory broadcast serves the repeated addresses directly.
+                    const float ks0 = __half2float(k_scale_s[keya * Groups + grp]);
+                    const float ks1 = __half2float(k_scale_s[keyb * Groups + grp]);
                     score[nt][0] = __fmaf_rn(qs0 * ks0, static_cast<float>(c0), score[nt][0]);
                     score[nt][1] = __fmaf_rn(qs0 * ks1, static_cast<float>(c1), score[nt][1]);
                     score[nt][2] = __fmaf_rn(qs1 * ks0, static_cast<float>(c2), score[nt][2]);
@@ -559,9 +547,7 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
                 __half* dst     = &v_f16[key_l * D + gqa_prefill_swz(key_l, d)];
                 if (key <= max_query_abs) {
                     const int grp = d >> 6;
-                    __half vs     = __float2half_rn(0.0f);
-                    if ((lane & 7) == 0) { vs = v_scale_s[key_l * Groups + grp]; }
-                    vs = __shfl_sync(FullMask, vs, grp * 8);
+                    const __half vs = v_scale_s[key_l * Groups + grp];
                     store_vec(dst, gqa_prefill_i8_dequant_f16x8(&v_i8[key_l * D + d], vs));
                 } else {
                     store_vec(dst, make_int4(0, 0, 0, 0));

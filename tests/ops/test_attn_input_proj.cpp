@@ -88,7 +88,8 @@ int run_q4_q5() {
         quantized_weight::make_patterned_weight(QType::Q5G64_F16S, kParent, kHidden, 107U));
 
     int failures = 0;
-    for (const std::int32_t tokens : {1, 2, 16, 17, 21, 48}) {
+    for (const std::int32_t tokens : {1, 2, 16, 17, 21, 48, 255, 256, 257, 512, 768,
+                                     1024, 1025, 2048}) {
         failures += run_q4_q5_case(query_key, gate_value, tokens);
     }
     return failures;
@@ -397,7 +398,14 @@ int run_w8_companion() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    bool q4_q5_only = false;
+    if (argc == 2 && std::string_view(argv[1]) == "--q4-q5-only") {
+        q4_q5_only = true;
+    } else if (argc != 1) {
+        std::cerr << "usage: " << argv[0] << " [--q4-q5-only]\n";
+        return 2;
+    }
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
@@ -405,10 +413,12 @@ int main() {
 
     int failures = 0;
     failures += run_q4_q5();
-    failures += run_bf16_target();
-    failures += run_nvfp4_target();
-    failures += run_w8_target();
-    failures += run_w8_companion();
+    if (!q4_q5_only) {
+        failures += run_bf16_target();
+        failures += run_nvfp4_target();
+        failures += run_w8_target();
+        failures += run_w8_companion();
+    }
     std::cout << (failures == 0 ? "OK" : "FAIL") << " attn_input_proj\n";
     return failures == 0 ? 0 : 1;
 }

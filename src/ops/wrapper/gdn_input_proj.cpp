@@ -548,10 +548,9 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
                                                    query, key, value, z, stream);
 }
 
-} // namespace
-
-void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
-                    Tensor& qkv, Tensor& z, cudaStream_t stream) {
+void dispatch_q4_q5(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                    Tensor& qkv, Tensor& z, WorkspaceArena* workspace, cudaStream_t stream,
+                    cublasHandle_t blas) {
     constexpr std::int32_t kHidden     = 5120;
     constexpr std::int32_t kQkRows     = 4096;
     constexpr std::int32_t kValueRows  = 6144;
@@ -565,8 +564,28 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
     require_matrix(z, kZRows, cols, "z");
     require_rowsplit(qk_weight, QType::Q4G64_F16S, kQkRows, "qk weight");
     require_rowsplit(value_z_weight, QType::Q5G64_F16S, kParentRows, "value/z weight");
+    require_single_parent_nonoverlap(x, qkv, z);
+    detail::q4_q5_gdn_input_dispatch(x, qk_weight, value_z_weight, qkv, z, stream,
+                                    workspace, blas);
+}
+} // namespace
 
-    detail::q4_q5_gdn_input_dispatch(x, qk_weight, value_z_weight, qkv, z, stream);
+void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                    Tensor& qkv, Tensor& z, cudaStream_t stream) {
+    dispatch_q4_q5(x, qk_weight, value_z_weight, qkv, z, nullptr, stream, nullptr);
+}
+
+std::size_t gdn_input_proj_workspace_capacity_bytes(
+    std::int32_t input_rows, std::int32_t qk_rows, std::int32_t value_z_rows,
+    std::int32_t min_tokens, std::int32_t max_tokens) {
+    return detail::q4_q5_gdn_input_capacity_workspace_bytes(
+        input_rows, qk_rows, value_z_rows, min_tokens, max_tokens);
+}
+
+void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                    Tensor& qkv, Tensor& z, WorkspaceArena& workspace, cudaStream_t stream,
+                    cublasHandle_t blas) {
+    dispatch_q4_q5(x, qk_weight, value_z_weight, qkv, z, &workspace, stream, blas);
 }
 
 std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent_rows,

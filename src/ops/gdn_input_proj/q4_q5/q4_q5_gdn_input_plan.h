@@ -1,8 +1,10 @@
 #pragma once
 
 #include "core/tensor.h"
+#include "core/arena.h"
 
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -12,6 +14,7 @@ namespace ninfer::ops::detail {
 enum class Q4Q5GdnInputScheduleId {
     IndependentDirectFixed,
     GroupedMixedMmaR64C128,
+    DequantCublasDirect2,
 };
 
 enum class Q4Q5GdnInputConvScheduleId {
@@ -31,6 +34,7 @@ struct Q4Q5GdnInputProblem {
 
 struct Q4Q5GdnInputPlan {
     Q4Q5GdnInputScheduleId schedule;
+    std::size_t workspace_bytes = 0;
 };
 
 struct Q4Q5GdnInputConvPlan {
@@ -41,15 +45,27 @@ const char* q4_q5_gdn_input_schedule_name(Q4Q5GdnInputScheduleId schedule) noexc
 const char* q4_q5_gdn_input_conv_schedule_name(Q4Q5GdnInputConvScheduleId schedule) noexcept;
 
 bool q4_q5_gdn_input_admits(const Q4Q5GdnInputProblem& problem) noexcept;
-Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem);
+Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem,
+                                             bool has_blas = false);
+std::size_t q4_q5_gdn_input_capacity_workspace_bytes(
+    std::int32_t input_rows, std::int32_t qk_rows, std::int32_t value_z_rows,
+    std::int32_t min_cols, std::int32_t max_cols);
 Q4Q5GdnInputConvPlan q4_q5_gdn_input_conv_resolve_plan(const Q4Q5GdnInputProblem& problem,
                                                        std::int32_t batch_size);
 
 void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
                                   const Weight& qk_weight, const Weight& value_z_weight,
-                                  Tensor& qkv, Tensor& z, cudaStream_t stream);
+                                  Tensor& qkv, Tensor& z, cudaStream_t stream,
+                                  WorkspaceArena* workspace = nullptr, cublasHandle_t blas = nullptr);
 void q4_q5_gdn_input_dispatch(const Tensor& x, const Weight& qk_weight,
                               const Weight& value_z_weight, Tensor& qkv, Tensor& z,
-                              cudaStream_t stream);
+                              cudaStream_t stream, WorkspaceArena* workspace = nullptr,
+                              cublasHandle_t blas = nullptr);
+
+inline constexpr std::size_t kGdnBlasWorkspaceBytes = 16384;
+void q4_q5_gdn_input_cublas_launch(const Tensor& x, const Weight& qk_weight,
+                                   const Weight& value_z_weight, Tensor& qkv, Tensor& z,
+                                   WorkspaceArena& workspace, cudaStream_t stream,
+                                   cublasHandle_t blas);
 
 } // namespace ninfer::ops::detail

@@ -34,7 +34,7 @@ add_library(ninfer_core STATIC
   runtime/engine/request_memory.cpp)
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
-target_link_libraries(ninfer_core PUBLIC ${NINFER_CUDART_TARGET} CUDA::nvtx3)
+target_link_libraries(ninfer_core PUBLIC ${NINFER_CUDART_TARGET} CUDA::nvtx3 ninfer_cublas)
 
 # Generic .ninfer framing, binding, and direct final materialization.
 add_library(ninfer_artifact STATIC
@@ -128,6 +128,7 @@ add_library(ninfer_ops STATIC
   ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_post.cu
   ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.cpp
   ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_gemm_mma.cu
+  ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_cublas.cu
   ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu
   ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_conv_snapshot.cu
   ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.cpp
@@ -165,6 +166,7 @@ add_library(ninfer_ops STATIC
   ops/linear_add/nvfp4/nvfp4_linear_add_w4a4.cu
   ops/linear_add/nvfp4/nvfp4_linear_add_plan.cpp
   ops/linear_add/q5/q5_linear_add_gemm_mma.cu
+  ops/linear_add/q5/q5_linear_add_cublas.cu
   ops/linear_add/q5/q5_linear_add_gemm_simt.cu
   ops/linear_add/q5/q5_linear_add_gemv.cu
   ops/linear_add/q5/q5_linear_add_plan.cpp
@@ -249,6 +251,59 @@ if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(86|89)$")
 endif()
 ninfer_internal_includes(ninfer_ops)
 ninfer_cuda_archive(ninfer_ops)
+
+# Optional, measured SM86 code-generation specialization. The main toolkit,
+# runtime, device linker, and every other translation unit remain unchanged.
+set(NINFER_Q4_FULL_NVCC "" CACHE FILEPATH
+  "Experimental CUDA 12.6 nvcc for aligned Q4 SwiGLU prefill; empty uses the main compiler")
+if(NINFER_Q4_FULL_NVCC)
+  if(NOT WIN32 OR NOT MSVC OR NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "86"
+      OR CMAKE_CONFIGURATION_TYPES OR NOT CMAKE_BUILD_TYPE STREQUAL "Release")
+    message(FATAL_ERROR
+      "NINFER_Q4_FULL_NVCC is qualified only for Windows/MSVC SM86 single-config Release")
+  endif()
+  if(NOT EXISTS "${NINFER_Q4_FULL_NVCC}")
+    message(FATAL_ERROR "NINFER_Q4_FULL_NVCC does not exist: ${NINFER_Q4_FULL_NVCC}")
+  endif()
+  execute_process(COMMAND "${NINFER_Q4_FULL_NVCC}" --version
+    RESULT_VARIABLE q4_nvcc_status OUTPUT_VARIABLE q4_nvcc_version
+    ERROR_VARIABLE q4_nvcc_error)
+  if(NOT q4_nvcc_status EQUAL 0 OR NOT q4_nvcc_version MATCHES "release 12\\.6[, ]")
+    message(FATAL_ERROR "NINFER_Q4_FULL_NVCC must be CUDA 12.6: ${q4_nvcc_error}")
+  endif()
+  get_filename_component(q4_nvcc_bin "${NINFER_Q4_FULL_NVCC}" DIRECTORY)
+  get_filename_component(q4_cuda_root "${q4_nvcc_bin}" DIRECTORY)
+  get_filename_component(q4_host_compiler_dir "${CMAKE_CXX_COMPILER}" DIRECTORY)
+  set(q4_full_source
+    "${CMAKE_CURRENT_SOURCE_DIR}/ops/linear_swiglu/q4/q4_linear_swiglu_full_cuda126.cu")
+  set(q4_full_object_dir "${CMAKE_CURRENT_BINARY_DIR}/q4_cuda126")
+  set(q4_full_object "${q4_full_object_dir}/q4_linear_swiglu_full_cuda126.obj")
+  set(q4_full_depfile "${q4_full_object}.d")
+  add_custom_command(OUTPUT "${q4_full_object}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${q4_full_object_dir}"
+    COMMAND "${CMAKE_COMMAND}" -E env "CUDA_PATH=${q4_cuda_root}"
+      --modify "PATH=path_list_prepend:${q4_nvcc_bin}"
+      --modify "PATH=path_list_prepend:${q4_host_compiler_dir}"
+      "${NINFER_Q4_FULL_NVCC}" --use-local-env -O3 -std=c++20 -rdc=true
+      "--compiler-bindir=${q4_host_compiler_dir}"
+      "--generate-code=arch=compute_86,code=[compute_86,sm_86]" -lineinfo
+      -DNINFER_SM8X_COMPAT=1 -DNOMINMAX -DWIN32_LEAN_AND_MEAN -D_WINDOWS -DNDEBUG
+      -Xcompiler=/MD,/Zc:preprocessor,/EHsc,/O2,/Ob2,/utf-8
+      "-I${PROJECT_SOURCE_DIR}/include" "-I${PROJECT_SOURCE_DIR}/src"
+      -MD -MT "${q4_full_object}" -MF "${q4_full_depfile}"
+      -c "${q4_full_source}" -o "${q4_full_object}"
+    DEPENDS "${q4_full_source}" "${NINFER_Q4_FULL_NVCC}"
+    DEPFILE "${q4_full_depfile}"
+    COMMENT "Building aligned Q4 SwiGLU with the selected CUDA 12.6 compiler"
+    VERBATIM)
+  set_source_files_properties("${q4_full_object}" PROPERTIES
+    EXTERNAL_OBJECT TRUE GENERATED TRUE)
+  target_sources(ninfer_ops PRIVATE "${q4_full_object}")
+  # Keep this local: a target-wide definition would rebuild unrelated Ops.
+  set_property(SOURCE ops/linear_swiglu/q4/q4_linear_swiglu_gemm_mma.cu
+    APPEND PROPERTY COMPILE_DEFINITIONS NINFER_Q4_CUDA126_FULL=1)
+endif()
+
 target_link_libraries(ninfer_ops PUBLIC ninfer_core)
 if(TARGET ninfer_nvfp4_tma)
   target_link_libraries(ninfer_ops PRIVATE ninfer_nvfp4_tma)

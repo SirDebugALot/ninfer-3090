@@ -1,6 +1,7 @@
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.h"
 
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h"
+#include "core/layout.h"
 
 #include <array>
 #include <limits>
@@ -42,6 +43,13 @@ bool supported_shape(const Q4Q5GdnInputProblem& problem) noexcept {
            problem.qkv_rows == 10240 && problem.z_rows == 6144 && problem.padded_k == 5120;
 }
 
+std::size_t cublas_workspace_bytes() {
+    WorkspaceLayoutBuilder layout;
+    (void)layout.alloc_bytes(std::size_t(16384) * 5120 * 2);
+    (void)layout.alloc_bytes(kGdnBlasWorkspaceBytes);
+    return layout.peak_bytes();
+}
+
 } // namespace
 
 const char* q4_q5_gdn_input_schedule_name(Q4Q5GdnInputScheduleId schedule) noexcept {
@@ -50,6 +58,8 @@ const char* q4_q5_gdn_input_schedule_name(Q4Q5GdnInputScheduleId schedule) noexc
         return "gdn_input_proj.q4_q5.independent_direct_fixed";
     case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128:
         return "gdn_input_proj.q4_q5.grouped_mixed.mma.r64.c128";
+    case Q4Q5GdnInputScheduleId::DequantCublasDirect2:
+        return "gdn_input_proj.q4_q5.dequant_cublas_direct2";
     }
     return "gdn_input_proj.q4_q5.unknown";
 }
@@ -68,17 +78,33 @@ bool q4_q5_gdn_input_admits(const Q4Q5GdnInputProblem& problem) noexcept {
     return supported_shape(problem) && problem.cols >= 1;
 }
 
-Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem) {
+Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem, bool has_blas) {
     if (!q4_q5_gdn_input_admits(problem)) {
         throw std::invalid_argument(
             "Q4/Q5 GDN input: exact problem or column count is not admitted");
     }
 
+    if (has_blas && problem.cols >= 1024 && (problem.cols % 128) == 0) {
+        return {Q4Q5GdnInputScheduleId::DequantCublasDirect2, cublas_workspace_bytes()};
+    }
     for (const RouteSpec& route : kRoutes) {
         if (!route.cols.contains(problem.cols)) { continue; }
         return {route.schedule};
     }
     throw std::logic_error("Q4/Q5 GDN input: admitted problem has no covering route");
+}
+
+std::size_t q4_q5_gdn_input_capacity_workspace_bytes(
+    std::int32_t input_rows, std::int32_t qk_rows, std::int32_t value_z_rows,
+    std::int32_t min_cols, std::int32_t max_cols) {
+    if (min_cols <= 0 || max_cols < min_cols) {
+        throw std::invalid_argument("Q4/Q5 GDN input: invalid column interval");
+    }
+    (void)q4_q5_gdn_input_resolve_plan(
+        {input_rows, qk_rows, value_z_rows, 10240, 6144, input_rows, min_cols});
+    const std::int32_t last_aligned = (max_cols / 128) * 128;
+    return last_aligned >= 1024 && last_aligned >= min_cols
+               ? cublas_workspace_bytes() : 0;
 }
 
 Q4Q5GdnInputConvPlan q4_q5_gdn_input_conv_resolve_plan(const Q4Q5GdnInputProblem& problem,
@@ -102,16 +128,22 @@ Q4Q5GdnInputConvPlan q4_q5_gdn_input_conv_resolve_plan(const Q4Q5GdnInputProblem
 
 void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
                                   const Weight& qk_weight, const Weight& value_z_weight,
-                                  Tensor& qkv, Tensor& z, cudaStream_t stream) {
+                                  Tensor& qkv, Tensor& z, cudaStream_t stream,
+                                  WorkspaceArena* workspace, cublasHandle_t blas) {
     const Q4Q5GdnInputProblem problem{x.ne[0],   qk_weight.n, value_z_weight.n,
                                       qkv.ne[0], z.ne[0],     qk_weight.padded_shape[1],
                                       x.ne[1]};
-    const Q4Q5GdnInputPlan resolved = q4_q5_gdn_input_resolve_plan(problem);
-    if (resolved.schedule != plan.schedule) {
+    const Q4Q5GdnInputPlan resolved =
+        q4_q5_gdn_input_resolve_plan(problem, workspace != nullptr && blas != nullptr);
+    if (resolved.schedule != plan.schedule || resolved.workspace_bytes != plan.workspace_bytes) {
         throw std::invalid_argument("Q4/Q5 GDN input: plan does not match exact problem");
     }
 
     switch (plan.schedule) {
+    case Q4Q5GdnInputScheduleId::DequantCublasDirect2:
+        q4_q5_gdn_input_cublas_launch(x, qk_weight, value_z_weight, qkv, z, *workspace,
+                                     stream, blas);
+        return;
     case Q4Q5GdnInputScheduleId::IndependentDirectFixed: {
         Tensor qk    = qkv.slice(0, 0, problem.qk_rows);
         Tensor value = qkv.slice(0, problem.qk_rows, problem.z_rows);
@@ -127,12 +159,14 @@ void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
 
 void q4_q5_gdn_input_dispatch(const Tensor& x, const Weight& qk_weight,
                               const Weight& value_z_weight, Tensor& qkv, Tensor& z,
-                              cudaStream_t stream) {
+                              cudaStream_t stream, WorkspaceArena* workspace, cublasHandle_t blas) {
     const Q4Q5GdnInputProblem problem{x.ne[0],   qk_weight.n, value_z_weight.n,
                                       qkv.ne[0], z.ne[0],     qk_weight.padded_shape[1],
                                       x.ne[1]};
-    const Q4Q5GdnInputPlan plan = q4_q5_gdn_input_resolve_plan(problem);
-    q4_q5_gdn_input_execute_plan(plan, x, qk_weight, value_z_weight, qkv, z, stream);
+    const Q4Q5GdnInputPlan plan =
+        q4_q5_gdn_input_resolve_plan(problem, workspace != nullptr && blas != nullptr);
+    q4_q5_gdn_input_execute_plan(plan, x, qk_weight, value_z_weight, qkv, z, stream,
+                                workspace, blas);
 }
 
 } // namespace ninfer::ops::detail
