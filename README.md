@@ -78,6 +78,7 @@ results yet.
 |---|---|
 | `run-qwen38-c1.bat` | One interactive user, lowest latency, up to 64K context |
 | `run-qwen38-c8.bat` | Multiple users or agents, highest aggregate throughput, 8K context |
+| `run-qwen38-c6-96k-rk8v4.bat` | Six concurrent requests sharing a 96K RK8V4 cache (8-bit keys, 4-bit values) |
 | `run-qwen38-vision.bat` | Qwen3.8 image understanding, one user, 32K context, MTP3 |
 | `run-qwen36-35b-vision.bat` | Image understanding with Qwen3.6-35B-A3B, one user, 32K context |
 

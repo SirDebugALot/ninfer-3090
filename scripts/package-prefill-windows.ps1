@@ -56,6 +56,7 @@ Copy-Item -LiteralPath (Join-Path $repoRoot 'docs/rtx-3090-windows.md') -Destina
 Copy-Item -LiteralPath (Join-Path $repoRoot 'RELEASE_NOTES_PREFILL.md') -Destination $productRoot
 Copy-Item -LiteralPath (Join-Path $repoRoot 'scripts/download-qwen38.bat') -Destination $productRoot
 Copy-Item -LiteralPath (Join-Path $repoRoot 'scripts/run-qwen38-prefill-c6-64k.bat') -Destination $productRoot
+Copy-Item -LiteralPath (Join-Path $repoRoot 'scripts/run-qwen38-c6-96k-rk8v4.bat') -Destination $productRoot
 
 $innerHashes = Get-ChildItem -LiteralPath $productRoot -File | Sort-Object Name | ForEach-Object {
     $hash = Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256
