@@ -1,9 +1,10 @@
 # GitHub 공개 방법 - 처음 사용하는 분용
 
 이 작업 트리는 이미 공개용 브랜치 `rtx3090-faster-prefill`에 있습니다.
-저장소는 `Don-Chad/ninfer-3090`이고, 공개 제목은 **NInfer RTX 3090 -
-Faster Prefill**을 권장합니다. 성능 구현은 Round 11 기준이며, 이후의
-UTF-8 복구는 별도의 안정성 수정입니다.
+원본 저장소는 `Don-Chad/ninfer-3090`, 공개 Fork는
+`SirDebugALot/ninfer-3090`이고, 공개 제목은 **NInfer RTX 3090 - Faster
+Prefill**을 권장합니다. 성능 구현은 Round 11 기준이며, 이후의 UTF-8
+복구는 별도의 안정성 수정입니다.
 
 공개 README의 성능 수치는 공식 v0.6.1 Windows 바이너리와 Round 11의
 32K INT8 동일 조건 A/B/B/A 결과인 **785.03 -> 1037.43 tok/s (+32.15%)**를

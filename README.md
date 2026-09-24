@@ -67,7 +67,7 @@ results yet.
 
 ### Windows 11
 
-1. Download and unzip the latest [Windows release](https://github.com/Don-Chad/ninfer-3090/releases/latest).
+1. Download and unzip the latest [Windows release](https://github.com/SirDebugALot/ninfer-3090/releases/latest).
 2. Double-click `download-qwen38.bat` to download the model. Interrupted downloads resume.
 3. Double-click one launcher:
 
