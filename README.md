@@ -1,17 +1,20 @@
-# NInfer-3090
+# NInfer RTX 3090 - Faster Qwen3.8 Prefill
 
-> **RTX 3090 faster-prefill branch:** `rtx3090-faster-prefill`
-> Based on `v0.6.1-rtx3090`, with the accepted Round 11 SM86 prefill
-> optimizations and the later generated-UTF-8 serving recovery.
+> **RTX 3090/SM86-optimized NInfer fork:** accepted Round 11 performance
+> kernels plus generated-UTF-8 serving recovery, based on `v0.6.1-rtx3090`.
 
-## Faster Qwen3.8-27B prefill on RTX 3090
+## 32K prefill: 32.15% faster than the official v0.6.1 binary
 
-This branch specializes the Q4/Q5 prefill paths for GA102/SM86. A balanced
-fresh-process A/B/B/A comparison on the local RTX 3090 measured **785.03 tok/s**
-for the official v0.6.1 Windows binary and **1,037.43 tok/s** for the accepted
-Round 11 build at 32K input: **+32.15%**. The strict comparison uses INT8 KV,
-the newest KV format supported by both binaries; the official benchmark does
-not support RK8V4.
+| Windows build | 32,768-token prefill |
+|---|---:|
+| Official NInfer-3090 v0.6.1 | **785.03 tok/s** |
+| This Round 11 optimized build | **1,037.43 tok/s** |
+
+**Result: 1.32x throughput, or +32.15%.** This is a balanced fresh-process
+A/B/B/A comparison on the same RTX 3090, model, corpus, 64K capacity, chunk
+2048, MTP3, LM-head draft and CUDA Graph configuration. The strict comparison
+uses INT8 KV, the newest KV format supported by both binaries; the official
+v0.6.1 benchmark does not support RK8V4.
 
 The main retained changes are a CUDA-12.6-compiled aligned Q4 SwiGLU path with
 wider per-warp token reuse, target-specific Q4/Q5 projection routes using
